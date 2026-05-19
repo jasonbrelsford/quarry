@@ -460,6 +460,9 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 .card-body{padding:0}
 table{width:100%;border-collapse:collapse}
 th{text-align:left;padding:8px 12px;font-size:11px;color:#8b949e;font-weight:500;border-bottom:1px solid #1e2a3a;background:#0d1117;position:sticky;top:0}
+th.sortable{cursor:pointer;user-select:none}
+th.sortable:hover{color:#58a6ff}
+th.sortable span{font-size:10px;margin-left:2px}
 td{padding:7px 12px;border-bottom:1px solid #1e2a3a;font-size:12px}
 tr:hover{background:#1c2128}
 .eco-tag{display:inline-block;padding:1px 6px;border-radius:3px;font-size:10px;font-weight:500}
@@ -540,7 +543,16 @@ tr:hover{background:#1c2128}
   </div>
   <div class="card-body scrollable">
     <table>
-      <thead><tr><th>Package</th><th>Version</th><th>Ecosystem</th><th>Age</th><th>Status</th><th>Last Requested By</th><th>Override</th><th>Actions</th></tr></thead>
+      <thead><tr>
+        <th class="sortable" onclick="sortPackages('package')">Package <span id="sort-package"></span></th>
+        <th class="sortable" onclick="sortPackages('version')">Version <span id="sort-version"></span></th>
+        <th class="sortable" onclick="sortPackages('ecosystem')">Ecosystem <span id="sort-ecosystem"></span></th>
+        <th class="sortable" onclick="sortPackages('age')">Age <span id="sort-age"></span></th>
+        <th class="sortable" onclick="sortPackages('status')">Status <span id="sort-status"></span></th>
+        <th>Last Requested By</th>
+        <th class="sortable" onclick="sortPackages('override')">Override <span id="sort-override"></span></th>
+        <th>Actions</th>
+      </tr></thead>
       <tbody id="pkg-body"><tr><td colspan="8" class="empty">Loading...</td></tr></tbody>
     </table>
   </div>
@@ -665,6 +677,8 @@ tr:hover{background:#1c2128}
 let allPackages = [];
 let isAdmin = false;
 let authHeader = null;
+let sortField = null;
+let sortDir = 'asc';
 
 async function checkAuth() {
   try {
@@ -846,6 +860,20 @@ async function refresh() {
   } catch(e) { console.error('Refresh failed:', e); }
 }
 
+function sortPackages(field) {
+  if (sortField === field) {
+    sortDir = sortDir === 'asc' ? 'desc' : 'asc';
+  } else {
+    sortField = field;
+    sortDir = 'asc';
+  }
+  // Update sort indicators
+  document.querySelectorAll('th.sortable span').forEach(s => s.textContent = '');
+  const indicator = document.getElementById('sort-' + field);
+  if (indicator) indicator.textContent = sortDir === 'asc' ? '▲' : '▼';
+  renderPackages();
+}
+
 function renderPackages() {
   const filter = document.getElementById('pkg-filter').value.toLowerCase();
   const statusFilter = document.getElementById('pkg-status-filter').value;
@@ -858,6 +886,27 @@ function renderPackages() {
     else filtered = filtered.filter(p => p.status === statusFilter && !p.override);
   }
   if (ecoFilter !== 'all') filtered = filtered.filter(p => p.ecosystem === ecoFilter);
+
+  // Apply sorting
+  if (sortField) {
+    filtered.sort((a, b) => {
+      let valA, valB;
+      switch (sortField) {
+        case 'package': valA = a.package || ''; valB = b.package || ''; break;
+        case 'version': valA = a.version || ''; valB = b.version || ''; break;
+        case 'ecosystem': valA = a.ecosystem || ''; valB = b.ecosystem || ''; break;
+        case 'age': valA = a.age_days ?? 99999; valB = b.age_days ?? 99999; break;
+        case 'status': valA = a.status || ''; valB = b.status || ''; break;
+        case 'override': valA = a.override || ''; valB = b.override || ''; break;
+        default: return 0;
+      }
+      if (sortField === 'age') {
+        return sortDir === 'asc' ? valA - valB : valB - valA;
+      }
+      const cmp = String(valA).localeCompare(String(valB));
+      return sortDir === 'asc' ? cmp : -cmp;
+    });
+  }
 
   const tbody = document.getElementById('pkg-body');
   if (filtered.length === 0) {
