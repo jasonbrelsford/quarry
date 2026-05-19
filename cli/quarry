@@ -1,0 +1,386 @@
+#!/usr/bin/env python3
+"""
+Quarry CLI — Supply chain security proxy management tool.
+
+Usage:
+    quarry status                         Show proxy status and stats
+    quarry log [--limit N]                Recent package requests
+    quarry allow <ecosystem> <package>    Override: allow a package
+    quarry block <ecosystem> <package>    Override: permanently block a package
+    quarry clear <ecosystem> <package>    Remove override, return to auto policy
+    quarry rules                          Show active rules
+    quarry config show                    Show current settings
+    quarry config set <key> <value>       Update a setting
+    quarry simulate <ecosystem> <package> [version]  Test what would happen
+
+Examples:
+    quarry status
+    quarry allow maven org.apache.commons:commons-lang3
+    quarry block npm event-stream
+    quarry log --limit 20
+    quarry config set cooling-days 14
+    quarry simulate npm lodash 4.17.21
+"""
+import argparse
+import json
+import os
+import sys
+
+try:
+    import requests
+except ImportError:
+    print("Error: 'requests' package required. Install with: pip install requests")
+    sys.exit(1)
+
+
+# ── Config ────────────────────────────────────────────────────────────────
+
+DEFAULT_URL = "http://localhost:8080"
+CONFIG_FILE = os.path.expanduser("~/.quarry.json")
+
+
+def load_config():
+    """Load CLI config from ~/.quarry.json"""
+    defaults = {"url": DEFAULT_URL, "token": ""}
+    if os.path.exists(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE) as f:
+                saved = json.load(f)
+                defaults.update(saved)
+        except (json.JSONDecodeError, IOError):
+            pass
+    return defaults
+
+
+def save_config(config):
+    """Save CLI config to ~/.quarry.json"""
+    with open(CONFIG_FILE, "w") as f:
+        json.dump(config, f, indent=2)
+
+
+def get_base_url():
+    config = load_config()
+    return os.environ.get("QUARRY_URL", config.get("url", DEFAULT_URL))
+
+
+def get_headers():
+    config = load_config()
+    token = os.environ.get("QUARRY_TOKEN", config.get("token", ""))
+    headers = {"Content-Type": "application/json"}
+    if token:
+        headers["Authorization"] = f"Basic {token}"
+    return headers
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────
+
+def api_get(path, params=None):
+    url = f"{get_base_url()}{path}"
+    try:
+        r = requests.get(url, headers=get_headers(), params=params, timeout=10)
+        r.raise_for_status()
+        return r.json()
+    except requests.ConnectionError:
+        print(f"Error: Cannot connect to Quarry at {get_base_url()}")
+        print(f"Set QUARRY_URL or run: quarry config set url <your-validator-url>")
+        sys.exit(1)
+    except requests.HTTPError as e:
+        print(f"Error: {e.response.status_code} — {e.response.text}")
+        sys.exit(1)
+
+
+def api_post(path, data=None):
+    url = f"{get_base_url()}{path}"
+    try:
+        r = requests.post(url, headers=get_headers(), json=data, timeout=10)
+        r.raise_for_status()
+        return r.json()
+    except requests.ConnectionError:
+        print(f"Error: Cannot connect to Quarry at {get_base_url()}")
+        sys.exit(1)
+    except requests.HTTPError as e:
+        print(f"Error: {e.response.status_code} — {e.response.text}")
+        sys.exit(1)
+
+
+def color(text, code):
+    """ANSI color if terminal supports it."""
+    if not sys.stdout.isatty():
+        return text
+    return f"\033[{code}m{text}\033[0m"
+
+
+def red(text): return color(text, "31")
+def green(text): return color(text, "32")
+def yellow(text): return color(text, "33")
+def blue(text): return color(text, "34")
+def dim(text): return color(text, "90")
+
+
+# ── Commands ──────────────────────────────────────────────────────────────
+
+def cmd_status(args):
+    """Show proxy status and stats."""
+    health = api_get("/health")
+    stats = api_get("/stats")
+
+    print(f"\n  {blue('Quarry')} — Supply Chain Security Proxy\n")
+    print(f"  Status:        {green('●')} {health.get('status', 'unknown')}")
+    print(f"  Cooling Days:  {yellow(str(health.get('cooling_days', '?')))}")
+    print(f"  Cache:         {stats.get('cache', 'unknown')}")
+
+    if "cached_decisions" in stats:
+        print(f"\n  Decisions cached: {stats['cached_decisions']}")
+    if "rules" in stats:
+        rules = stats["rules"]
+        print(f"  Rules:          {rules.get('allow_count', 0)} allow, {rules.get('block_count', 0)} block")
+
+    print()
+
+
+def cmd_log(args):
+    """Show recent package requests."""
+    # Try validator /requests first, then dashboard /api/requests
+    try:
+        data = api_get("/requests", params={"limit": args.limit})
+    except SystemExit:
+        data = {"requests": []}
+
+    reqs = data.get("requests", [])
+    if not reqs:
+        print("No recent requests. (Requests are logged after packages flow through the proxy)")
+        return
+
+    print(f"\n  {'Time':<20} {'Decision':<10} {'Ecosystem':<8} {'Package':<40} {'Age':<8}")
+    print(f"  {'─' * 86}")
+
+    for r in reqs[:args.limit]:
+        decision = r.get("decision", "?")
+        if "block" in decision:
+            dec_str = red("BLOCK")
+        elif "allow" in decision:
+            dec_str = green("ALLOW")
+        else:
+            dec_str = yellow(decision)
+
+        age = r.get("age_days")
+        age_str = f"{age:.1f}d" if age is not None else "—"
+
+        ts = r.get("timestamp", "")[:19].replace("T", " ")
+
+        print(f"  {dim(ts):<20} {dec_str:<10} {r.get('ecosystem', '?'):<8} {r.get('package', '?'):<40} {age_str:<8}")
+
+    total = data.get("total", len(reqs))
+    shown = min(len(reqs), args.limit)
+    print(f"\n  {dim(f'Showing {shown} of {total} requests')}\n")
+
+
+def cmd_allow(args):
+    """Override: allow a package."""
+    data = api_post("/api/packages/override", {
+        "package": args.package,
+        "ecosystem": args.ecosystem,
+        "action": "allow",
+    })
+    print(f"  {green('✓')} Allowed {args.ecosystem}/{args.package}")
+
+
+def cmd_block(args):
+    """Override: permanently block a package."""
+    data = api_post("/api/packages/override", {
+        "package": args.package,
+        "ecosystem": args.ecosystem,
+        "action": "deny",
+    })
+    print(f"  {red('✗')} Blocked {args.ecosystem}/{args.package}")
+
+
+def cmd_clear(args):
+    """Remove override, return to automatic policy."""
+    data = api_post("/api/packages/override", {
+        "package": args.package,
+        "ecosystem": args.ecosystem,
+        "action": "clear",
+    })
+    print(f"  {yellow('↺')} Cleared override for {args.ecosystem}/{args.package}")
+
+
+def cmd_rules(args):
+    """Show active rules."""
+    data = api_get("/rules")
+
+    block_rules = data.get("block", [])
+    allow_rules = data.get("allow", [])
+
+    print(f"\n  {blue('Block Rules')} ({len(block_rules)})")
+    if block_rules:
+        for r in block_rules:
+            ver = f"@{r['version']}" if r.get("version") else ""
+            print(f"    {red('✗')} {r.get('ecosystem', '?')}/{r.get('package', '?')}{ver}")
+            print(f"      {dim(r.get('reason', ''))}")
+    else:
+        print(f"    {dim('None')}")
+
+    print(f"\n  {blue('Allow Rules')} ({len(allow_rules)})")
+    if allow_rules:
+        for r in allow_rules:
+            print(f"    {green('✓')} {r.get('ecosystem', '?')}/{r.get('package', '?')}")
+            print(f"      {dim(r.get('reason', ''))}")
+    else:
+        print(f"    {dim('None')}")
+
+    print()
+
+
+def cmd_simulate(args):
+    """Simulate what would happen for a package request."""
+    params = {"ecosystem": args.ecosystem, "package": args.package}
+    if args.version:
+        params["version"] = args.version
+
+    data = api_get("/test/simulate", params=params)
+
+    decision = data.get("decision", "unknown")
+    if decision == "block":
+        dec_str = red("BLOCK")
+    elif decision == "allow":
+        dec_str = green("ALLOW")
+    else:
+        dec_str = yellow(decision)
+
+    print(f"\n  Package:   {args.ecosystem}/{args.package}" + (f"@{args.version}" if args.version else ""))
+    print(f"  Decision:  {dec_str}")
+    print(f"  Reason:    {data.get('reason', '—')}")
+
+    if data.get("age_days") is not None:
+        print(f"  Age:       {data['age_days']} days")
+    if data.get("publish_date"):
+        print(f"  Published: {data['publish_date'][:10]}")
+    if data.get("cooling_days"):
+        print(f"  Threshold: {data['cooling_days']} days")
+    if data.get("source"):
+        print(f"  Source:    {dim(data['source'])}")
+
+    print()
+
+
+def cmd_config(args):
+    """Manage CLI configuration."""
+    config = load_config()
+
+    if args.config_action == "show":
+        print(f"\n  {blue('Quarry CLI Config')} ({CONFIG_FILE})\n")
+        print(f"  url:    {config.get('url', DEFAULT_URL)}")
+        token = config.get("token", "")
+        print(f"  token:  {'••••' + token[-4:] if token else dim('not set')}")
+        print(f"\n  {dim('Override with QUARRY_URL and QUARRY_TOKEN env vars')}\n")
+
+    elif args.config_action == "set":
+        key = args.key
+        value = args.value
+
+        # Map friendly names
+        key_map = {
+            "url": "url",
+            "token": "token",
+            "cooling-days": "_setting_cooling_days",
+            "bypass-token": "_setting_bypass_token",
+            "log-level": "_setting_log_level",
+            "fail-open": "_setting_fail_open",
+        }
+
+        if key in ("cooling-days", "bypass-token", "log-level", "fail-open"):
+            # These are server-side settings, push to the API
+            api_key = key.replace("-", "_")
+            try:
+                api_post("/api/settings", {api_key: value})
+                print(f"  {green('✓')} Server setting '{key}' updated to '{value}'")
+            except SystemExit:
+                print(f"  {red('✗')} Failed to update server setting. Is the dashboard running?")
+        elif key in ("url", "token"):
+            config[key] = value
+            save_config(config)
+            print(f"  {green('✓')} CLI config '{key}' saved")
+        else:
+            print(f"  {red('✗')} Unknown key: {key}")
+            print(f"  CLI keys: url, token")
+            print(f"  Server keys: cooling-days, bypass-token, log-level, fail-open")
+            sys.exit(1)
+
+
+# ── Main ──────────────────────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="quarry",
+        description="Quarry — Supply chain security proxy CLI",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="Run 'quarry <command> --help' for more info on a command.",
+    )
+    subparsers = parser.add_subparsers(dest="command")
+
+    # status
+    subparsers.add_parser("status", help="Show proxy status and stats")
+
+    # log
+    log_parser = subparsers.add_parser("log", help="Recent package requests")
+    log_parser.add_argument("--limit", "-n", type=int, default=25, help="Number of entries (default: 25)")
+
+    # allow
+    allow_parser = subparsers.add_parser("allow", help="Override: allow a package")
+    allow_parser.add_argument("ecosystem", choices=["npm", "maven", "pypi"], help="Package ecosystem")
+    allow_parser.add_argument("package", help="Package name")
+
+    # block
+    block_parser = subparsers.add_parser("block", help="Override: permanently block a package")
+    block_parser.add_argument("ecosystem", choices=["npm", "maven", "pypi"], help="Package ecosystem")
+    block_parser.add_argument("package", help="Package name")
+
+    # clear
+    clear_parser = subparsers.add_parser("clear", help="Remove override")
+    clear_parser.add_argument("ecosystem", choices=["npm", "maven", "pypi"], help="Package ecosystem")
+    clear_parser.add_argument("package", help="Package name")
+
+    # rules
+    subparsers.add_parser("rules", help="Show active block/allow rules")
+
+    # simulate
+    sim_parser = subparsers.add_parser("simulate", help="Test what would happen for a package")
+    sim_parser.add_argument("ecosystem", choices=["npm", "maven", "pypi"], help="Package ecosystem")
+    sim_parser.add_argument("package", help="Package name")
+    sim_parser.add_argument("version", nargs="?", default=None, help="Version (optional)")
+
+    # config
+    config_parser = subparsers.add_parser("config", help="Manage CLI configuration")
+    config_sub = config_parser.add_subparsers(dest="config_action")
+    config_sub.add_parser("show", help="Show current config")
+    set_parser = config_sub.add_parser("set", help="Set a config value")
+    set_parser.add_argument("key", help="Config key (url, token, cooling-days, bypass-token, log-level, fail-open)")
+    set_parser.add_argument("value", help="Value to set")
+
+    args = parser.parse_args()
+
+    if not args.command:
+        parser.print_help()
+        sys.exit(0)
+
+    commands = {
+        "status": cmd_status,
+        "log": cmd_log,
+        "allow": cmd_allow,
+        "block": cmd_block,
+        "clear": cmd_clear,
+        "rules": cmd_rules,
+        "simulate": cmd_simulate,
+        "config": cmd_config,
+    }
+
+    cmd_func = commands.get(args.command)
+    if cmd_func:
+        cmd_func(args)
+    else:
+        parser.print_help()
+
+
+if __name__ == "__main__":
+    main()

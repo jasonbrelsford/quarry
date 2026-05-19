@@ -1,0 +1,70 @@
+# Nexus Cooling Proxy — Helm values
+
+replicaCount: 2
+
+validator:
+  image:
+    repository: registry.example.com/org/nexus-cooling-validator
+    tag: latest
+    pullPolicy: Always
+  coolingDays: 7
+  logLevel: INFO
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 256Mi
+
+nginx:
+  image:
+    repository: registry.example.com/org/nexus-cooling-nginx
+    tag: latest
+    pullPolicy: Always
+  resources:
+    requests:
+      cpu: 100m
+      memory: 64Mi
+    limits:
+      cpu: 500m
+      memory: 128Mi
+
+nexus:
+  # Internal Nexus service URL (not exposed to users)
+  host: nexus
+  port: 8081
+
+redis:
+  # Set to false if using an external Redis
+  enabled: true
+  image:
+    repository: redis
+    tag: 7-alpine
+  maxmemory: "128mb"
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      cpu: 200m
+      memory: 192Mi
+  persistence:
+    enabled: true
+    storageClass: gp2
+    size: 1Gi
+
+ingress:
+  enabled: true
+  host: artifacts.example.com
+  annotations:
+    kubernetes.io/ingress.class: nginx
+  tls:
+    enabled: true
+    secretName: artifacts-tls
+
+bypass:
+  # Emergency bypass token — set to a strong random value
+  # Devs can set X-Cooling-Bypass header to skip validation
+  token: ""
+  header: X-Cooling-Bypass

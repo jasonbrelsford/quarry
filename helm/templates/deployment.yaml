@@ -1,0 +1,82 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}
+  labels:
+    app: nexus-cooling-proxy
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      app: nexus-cooling-proxy
+  template:
+    metadata:
+      labels:
+        app: nexus-cooling-proxy
+    spec:
+      containers:
+        # nginx — front door
+        - name: nginx
+          image: "{{ .Values.nginx.image.repository }}:{{ .Values.nginx.image.tag }}"
+          imagePullPolicy: {{ .Values.nginx.image.pullPolicy }}
+          ports:
+            - containerPort: 80
+              name: http
+          env:
+            - name: NEXUS_HOST
+              value: "{{ .Values.nexus.host }}"
+            - name: NEXUS_PORT
+              value: "{{ .Values.nexus.port | toString }}"
+          resources:
+            {{- toYaml .Values.nginx.resources | nindent 12 }}
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 80
+            initialDelaySeconds: 5
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 80
+            initialDelaySeconds: 3
+
+        # Validator — checks package publish dates
+        - name: validator
+          image: "{{ .Values.validator.image.repository }}:{{ .Values.validator.image.tag }}"
+          imagePullPolicy: {{ .Values.validator.image.pullPolicy }}
+          ports:
+            - containerPort: 8080
+              name: validator
+          env:
+            - name: COOLING_DAYS
+              value: "{{ .Values.validator.coolingDays | toString }}"
+            - name: REDIS_URL
+              value: "redis://{{ .Release.Name }}-redis:6379"
+            - name: LOG_LEVEL
+              value: "{{ .Values.validator.logLevel }}"
+            - name: BYPASS_HEADER
+              value: "{{ .Values.bypass.header }}"
+            - name: BYPASS_TOKEN
+              value: "{{ .Values.bypass.token }}"
+            - name: RULES_FILE
+              value: "/app/rules/rules.yaml"
+          volumeMounts:
+            - name: rules
+              mountPath: /app/rules
+              readOnly: true
+          resources:
+            {{- toYaml .Values.validator.resources | nindent 12 }}
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 5
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 3
+      volumes:
+        - name: rules
+          configMap:
+            name: {{ .Release.Name }}-rules

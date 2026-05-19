@@ -1,0 +1,60 @@
+# Nexus Cooling Proxy — Package Override Rules
+#
+# These rules take precedence over the cooling period check.
+# Changes here persist across Redis restarts and pod migrations.
+# Edit via PR for audit trail.
+#
+# Supported actions:
+#   allow  — always allow, skip cooling period check
+#   block  — always block, regardless of age
+#
+# Fields:
+#   package   — package name (required)
+#   ecosystem — npm, pypi, maven (required)
+#   version   — specific version (optional, omit to match all versions)
+#   reason    — why this override exists (required)
+#   added_by  — who added it (optional)
+#   added_on  — date added (optional)
+
+overrides:
+  allow:
+    # Example: internal packages that aren't on public registries
+    # - package: "@myorg/internal-lib"
+    #   ecosystem: npm
+    #   reason: "Internal package, not on public registry"
+    #   added_by: admin
+    #   added_on: "2026-05-14"
+
+  block:
+    # Known supply chain attacks and malware
+    - package: "event-stream"
+      ecosystem: npm
+      reason: "Known supply chain attack (flatmap-stream incident)"
+      added_by: devops
+      added_on: "2026-05-14"
+
+    - package: "colors"
+      ecosystem: npm
+      version: "1.4.1"
+      reason: "Protestware - infinite loop in v1.4.1"
+      added_by: devops
+      added_on: "2026-05-14"
+
+    - package: "faker"
+      ecosystem: npm
+      version: "6.6.6"
+      reason: "Protestware - deleted all code in v6.6.6"
+      added_by: devops
+      added_on: "2026-05-14"
+
+    - package: "ctx"
+      ecosystem: pypi
+      reason: "Known malware - credential stealer"
+      added_by: devops
+      added_on: "2026-05-14"
+
+    - package: "peacenotwar"
+      ecosystem: npm
+      reason: "Protestware - writes files to disk"
+      added_by: devops
+      added_on: "2026-05-14"

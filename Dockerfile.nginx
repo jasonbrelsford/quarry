@@ -1,0 +1,11 @@
+FROM nginx:1.27-alpine
+
+RUN rm /etc/nginx/conf.d/default.conf
+COPY nginx/nginx.conf /etc/nginx/templates/default.conf.template
+
+# Only substitute NEXUS_HOST — leave nginx's own $variables alone
+ENV NGINX_ENVSUBST_TEMPLATE_SUFFIX=.template
+ENV NGINX_ENVSUBST_OUTPUT_DIR=/etc/nginx/conf.d
+ENV NEXUS_HOST=nexus
+
+EXPOSE 80

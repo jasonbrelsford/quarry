@@ -1,0 +1,5 @@
+apiVersion: v2
+name: nexus-cooling-proxy
+description: Reverse proxy that enforces a cooling period on new packages before allowing Nexus to cache them
+version: 0.1.0
+appVersion: "1.0.0"

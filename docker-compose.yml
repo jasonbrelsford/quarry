@@ -1,0 +1,95 @@
+# Local development / testing against real Nexus
+# Usage: podman-compose up --build
+# Then: curl http://localhost:8888/repository/npm-central/express
+#       pip install --index-url http://localhost:8888/repository/${PYPI_REPO_NAME:-pypi-proxy}/simple/ requests
+
+services:
+  nginx:
+    build:
+      context: .
+      dockerfile: Dockerfile.nginx
+    ports:
+      - "8888:80"
+    environment:
+      NEXUS_HOST: "${NEXUS_HOST:-nexus.example.com}"
+    depends_on:
+      - validator
+
+  validator:
+    build:
+      context: .
+      dockerfile: Dockerfile.validator
+    ports:
+      - "8080:8080"
+    environment:
+      COOLING_DAYS: "${COOLING_DAYS:-7}"
+      REDIS_URL: "${REDIS_URL:-redis://redis:6379}"
+      LOG_LEVEL: "DEBUG"
+      BYPASS_TOKEN: "${BYPASS_TOKEN:-}"
+      RULES_FILE: "/app/rules.yaml"
+    volumes:
+      - ./rules.yaml:/app/rules.yaml:ro
+    depends_on:
+      - redis
+
+  quarantine:
+    build:
+      context: .
+      dockerfile: Dockerfile.quarantine
+    ports:
+      - "8090:8090"
+    environment:
+      NEXUS_URL: "${NEXUS_URL:-https://nexus.example.com}"
+      NEXUS_USER: "${NEXUS_USER:-}"
+      NEXUS_PASSWORD: "${NEXUS_PASSWORD:-}"
+      REDIS_URL: "${REDIS_URL:-redis://redis:6379}"
+      GITHUB_WEBHOOK_SECRET: "${GITHUB_WEBHOOK_SECRET:-}"
+      LOG_LEVEL: "DEBUG"
+    depends_on:
+      - redis
+
+  dashboard:
+    build:
+      context: .
+      dockerfile: Dockerfile.dashboard
+    ports:
+      - "9000:8080"
+    environment:
+      REDIS_URL: "${REDIS_URL:-redis://redis:6379}"
+      VALIDATOR_URL: "${VALIDATOR_URL:-http://validator:8080}"
+      LDAP_URI: "${LDAP_URI:-ldap://ldap.example.com:389}"
+      LDAP_DOMAIN: "${LDAP_DOMAIN:-EXAMPLE}"
+      LDAP_REQUIRED_GROUP: "${LDAP_REQUIRED_GROUP:-admins}"
+      LDAP_ADMIN_GROUP: "${LDAP_ADMIN_GROUP:-admins}"
+      LDAP_USER_GROUP: "${LDAP_USER_GROUP:-users}"
+      LDAP_BASE_DN: "${LDAP_BASE_DN:-DC=example,DC=com}"
+      AUTH_ENABLED: "${AUTH_ENABLED:-true}"
+      LOCAL_ADMIN_PASSWORD: "${LOCAL_ADMIN_PASSWORD:-}"
+    depends_on:
+      - redis
+      - validator
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--maxmemory", "128mb", "--maxmemory-policy", "allkeys-lru", "--appendonly", "yes", "--appendfsync", "everysec"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+
+  jupyter:
+    build:
+      context: .
+      dockerfile: Dockerfile.jupyter
+    ports:
+      - "8889:8888"
+    dns:
+      - 8.8.8.8
+      - 8.8.4.4
+    depends_on:
+      - nginx
+      - validator
+      - dashboard
+
+volumes:
+  redis-data:
