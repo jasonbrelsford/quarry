@@ -248,6 +248,125 @@ def cmd_edicts(args):
     print()
 
 
+def cmd_scout(args):
+    """Scout public registries for recently published packages."""
+    from datetime import datetime, timezone
+
+    # Get hold days from the server if possible, otherwise use arg or default
+    hold_days = args.days
+    if not hold_days:
+        try:
+            health = api_get("/health")
+            hold_days = health.get("cooling_days", 7)
+        except SystemExit:
+            hold_days = 7
+
+    ecosystem = args.ecosystem
+    query = args.query or ""
+
+    print(f"\n  {bold('🔭 Scout Report')} — Packages published in the last {hold_days} days\n")
+
+    now = datetime.now(timezone.utc)
+    results = []
+
+    if ecosystem in ("maven", "all"):
+        print(f"  {dim('Scanning Maven Central...')}")
+        try:
+            q = f"g:{query}*" if query else "*:*"
+            r = requests.get("https://search.maven.org/solrsearch/select", params={
+                "q": q, "rows": args.limit, "wt": "json", "sort": "timestamp desc"
+            }, timeout=15)
+            data = r.json()
+            for doc in data.get("response", {}).get("docs", []):
+                ts = doc.get("timestamp", 0)
+                dt = datetime.fromtimestamp(ts / 1000, tz=timezone.utc)
+                age = (now - dt).days
+                gav = f"{doc.get('g')}:{doc.get('a')}:{doc.get('latestVersion')}"
+                results.append({"package": gav, "ecosystem": "maven", "age": age, "date": dt.strftime("%Y-%m-%d")})
+        except Exception as e:
+            print(f"  {red('x')} Maven Central query failed: {e}")
+
+    if ecosystem in ("npm", "all"):
+        print(f"  {dim('Scanning npm registry...')}")
+        try:
+            search_q = query or "scope:angular"
+            r = requests.get("https://registry.npmjs.org/-/v1/search", params={
+                "text": search_q, "size": args.limit, "quality": "0.0", "popularity": "0.0", "maintenance": "0.0"
+            }, timeout=15)
+            data = r.json()
+            for obj in data.get("objects", []):
+                pkg = obj.get("package", {})
+                date_str = pkg.get("date", "")
+                if date_str:
+                    dt = datetime.fromisoformat(date_str.replace("Z", "+00:00"))
+                    age = (now - dt).days
+                    results.append({"package": pkg.get("name", "?"), "ecosystem": "npm", "age": age, "date": dt.strftime("%Y-%m-%d")})
+        except Exception as e:
+            print(f"  {red('x')} npm registry query failed: {e}")
+
+    if ecosystem in ("pypi", "all"):
+        print(f"  {dim('Scanning PyPI...')}")
+        try:
+            r = requests.get("https://pypi.org/rss/updates.xml", timeout=15)
+            if r.status_code == 200:
+                import re
+                items = re.findall(r"<item>.*?</item>", r.text, re.DOTALL)
+                for item in items[:args.limit]:
+                    title_match = re.search(r"<title>(.*?)</title>", item)
+                    date_match = re.search(r"<pubDate>(.*?)</pubDate>", item)
+                    if title_match and date_match:
+                        from email.utils import parsedate_to_datetime
+                        try:
+                            title = title_match.group(1)
+                            dt = parsedate_to_datetime(date_match.group(1))
+                            age = (now - dt).days
+                            results.append({"package": title, "ecosystem": "pypi", "age": age, "date": dt.strftime("%Y-%m-%d")})
+                        except Exception:
+                            pass
+        except Exception as e:
+            print(f"  {red('x')} PyPI query failed: {e}")
+
+    if not results:
+        print(f"\n  {dim('No results found. Try a different query or ecosystem.')}\n")
+        return
+
+    results.sort(key=lambda x: x["age"])
+
+    held = [r for r in results if r["age"] < hold_days]
+    released = [r for r in results if r["age"] >= hold_days]
+
+    print(f"\n  {'Package':<55} {'Eco':<7} {'Age':<6} {'Status'}")
+    print(f"  {'─' * 80}")
+
+    for r in results[:args.limit]:
+        if r["age"] < hold_days:
+            status = red("⛔ HELD")
+        else:
+            status = green("✓ OK")
+        age_str = f"{r['age']}d"
+        print(f"  {r['package']:<55} {r['ecosystem']:<7} {age_str:<6} {status}")
+
+    print(f"\n  {red(str(len(held)))} would be held  |  {green(str(len(released)))} would pass")
+
+    if held:
+        maven_held = [r for r in held if r["ecosystem"] == "maven"]
+        if maven_held:
+            pkg = maven_held[0]
+            parts = pkg["package"].split(":")
+            if len(parts) == 3:
+                print(f"\n  {bold('To test with Maven, add to pom.xml:')}")
+                print(f"""
+  <dependency>
+      <groupId>{parts[0]}</groupId>
+      <artifactId>{parts[1]}</artifactId>
+      <version>{parts[2]}</version>
+  </dependency>""")
+                cache_path = parts[0].replace(".", "/")
+                print(f"\n  {dim(f'Then: rm -rf ~/.m2/repository/{cache_path} && mvn clean package')}")
+
+    print()
+
+
 def cmd_inspect(args):
     """Examine a package at the gate."""
     params = {"ecosystem": args.ecosystem, "package": args.package}
@@ -386,6 +505,13 @@ Supported registries/ecosystems:
     subparsers.add_parser("edicts", help="Show standing orders (rules)")
     subparsers.add_parser("rules", help=argparse.SUPPRESS)  # alias
 
+    # scout (scan for new packages)
+    scout_parser = subparsers.add_parser("scout", help="Scout registries for recently published packages")
+    scout_parser.add_argument("ecosystem", nargs="?", default="all", help="Registry to scan (maven, npm, pypi, or all)")
+    scout_parser.add_argument("--query", "-q", default="", help="Filter query (e.g. 'org.apache' for Maven)")
+    scout_parser.add_argument("--days", "-d", type=int, default=None, help="Override hold days threshold")
+    scout_parser.add_argument("--limit", "-n", type=int, default=20, help="Max results per registry (default: 20)")
+
     # inspect / simulate
     inspect_parser = subparsers.add_parser("inspect", help="Examine a package at the gate")
     inspect_parser.add_argument("ecosystem", help="Registry/ecosystem (npm, maven, pypi, gitlab, etc.)")
@@ -423,6 +549,7 @@ Supported registries/ecosystems:
         "clear": cmd_unseal,
         "edicts": cmd_edicts,
         "rules": cmd_edicts,
+        "scout": cmd_scout,
         "inspect": cmd_inspect,
         "simulate": cmd_inspect,
         "config": cmd_config,
