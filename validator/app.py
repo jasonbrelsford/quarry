@@ -483,6 +483,71 @@ async def validate(request: Request):
     return Response(status_code=200)
 
 
+@app.get("/validate-internal")
+async def validate_internal(request: Request):
+    """Called by nginx for hosted/internal repos. Block-list only, no hold period.
+
+    Internal packages are allowed immediately UNLESS:
+    1. Explicitly blocked in rules.yaml
+    2. Manually sealed via dashboard/CLI override
+    """
+    original_uri = request.headers.get("X-Original-URI", "")
+    if not original_uri:
+        return Response(status_code=200)
+
+    parsed = parse_request_path(original_uri)
+    if not parsed:
+        return Response(status_code=200)
+
+    ecosystem = parsed["ecosystem"]
+    package = parsed["package"]
+    version = parsed.get("version")
+
+    # Store version info for dashboard display
+    if cache and version:
+        cache.set(f"version:{ecosystem}:{package}", version)
+
+    # Check rules file overrides
+    rule_decision = rules.check(ecosystem, package, version)
+    if rule_decision == "block":
+        log.warning(f"BLOCK (internal, rule override): {ecosystem}/{package}")
+        _log_request(ecosystem, package, "block_rule_internal", request)
+        return Response(
+            status_code=403,
+            content=f"Package '{package}' is sealed by policy rule.\n"
+                    f"Contact your admin if you believe this is an error.",
+            media_type="text/plain",
+            headers={"X-Block-Reason": f"Package '{package}' is sealed by policy rule."},
+        )
+
+    # Check manual override (sealed via dashboard/CLI)
+    if cache:
+        override = cache.get(f"override:{ecosystem}:{package}")
+        if override == "deny":
+            log.warning(f"BLOCK (internal, manual seal): {ecosystem}/{package}")
+            _log_request(ecosystem, package, "block_sealed", request)
+            return Response(
+                status_code=403,
+                content=f"Package '{package}' has been manually sealed by an admin.\n"
+                        f"Contact your admin to unseal it.",
+                media_type="text/plain",
+                headers={"X-Block-Reason": f"Package '{package}' has been manually sealed."},
+            )
+
+        cached = cache.get(f"cooling:{ecosystem}:{package}")
+        if cached == "block":
+            log.warning(f"BLOCK (internal, cached seal): {ecosystem}/{package}")
+            return Response(
+                status_code=403,
+                content=f"Package '{package}' is blocked.",
+                media_type="text/plain",
+            )
+
+    # Internal package, not sealed — allow immediately
+    _log_request(ecosystem, package, "allow_internal", request)
+    return Response(status_code=200)
+
+
 @app.get("/health")
 async def health():
     """Health check endpoint."""
