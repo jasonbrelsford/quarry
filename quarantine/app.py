@@ -59,45 +59,76 @@ log = logging.getLogger("quarantine")
 
 # ── Background polling task ───────────────────────────────────────────────
 
+POLL_INTERVAL_FAST = int(os.environ.get("POLL_INTERVAL_FAST", "300"))   # 5 minutes when catching up
+POLL_INTERVAL_IDLE = int(os.environ.get("POLL_INTERVAL_IDLE", "1800"))  # 30 minutes when fully synced
+
+
 async def poll_advisory_sources():
-    """Background task that polls GitHub Advisory DB and OSV.dev for new malware every hour."""
+    """Background task that polls GitHub Advisory DB and OSV.dev for new malware.
+    
+    Adaptive polling:
+    - 5 minutes if new malware was found (still catching up)
+    - 30 minutes if fully synced (no new findings)
+    """
     while True:
+        found_new = False
         try:
-            await _poll_github_advisories()
-            await _poll_osv_dev()
+            new_github = await _poll_github_advisories()
+            new_osv = await _poll_osv_dev()
+            found_new = (new_github + new_osv) > 0
         except Exception as e:
             log.error(f"Poll failed: {e}")
-        await asyncio.sleep(POLL_INTERVAL_SECONDS)
+
+        interval = POLL_INTERVAL_FAST if found_new else POLL_INTERVAL_IDLE
+        log.info(f"Next poll in {interval // 60}m ({'catching up' if found_new else 'fully synced'})")
+        await asyncio.sleep(interval)
 
 
-async def _poll_github_advisories():
-    """Fetch recent malware advisories from GitHub and quarantine any new ones."""
+async def _poll_github_advisories() -> int:
+    """Fetch malware advisories from GitHub using cursor-based pagination.
+    
+    Returns the number of newly quarantined packages.
+    """
     log.info("Polling GitHub Advisory DB for new malware...")
     headers = {"Accept": "application/vnd.github+json"}
     if GITHUB_TOKEN:
         headers["Authorization"] = f"Bearer {GITHUB_TOKEN}"
 
     ecosystems = {"npm": "npm", "pip": "pip", "maven": "maven"}
+    total_new_all = 0
 
     for gh_eco, our_eco in ecosystems.items():
         try:
-            page = 1
             total_checked = 0
             total_new = 0
+            pages = 0
+            # Use cursor from Redis if we have one (resume from last position)
+            cursor_key = f"github:cursor:{gh_eco}"
+            after_cursor = cache.get(cursor_key) if cache else None
+
             async with httpx.AsyncClient(timeout=30) as client:
                 while True:
+                    params = {"type": "malware", "ecosystem": gh_eco, "per_page": 100}
+                    if after_cursor:
+                        params["after"] = after_cursor
+
                     resp = await client.get(
                         "https://api.github.com/advisories",
-                        params={"type": "malware", "ecosystem": gh_eco, "per_page": 100, "page": page},
+                        params=params,
                         headers=headers,
                     )
                     if resp.status_code != 200:
-                        log.warning(f"GitHub API returned {resp.status_code} for {gh_eco} (page {page})")
+                        log.warning(f"GitHub API returned {resp.status_code} for {gh_eco}")
                         break
 
                     advisories = resp.json()
                     if not advisories:
-                        break  # No more pages
+                        # Fully synced — clear cursor so next poll starts fresh
+                        if cache:
+                            cache.delete(cursor_key)
+                        break
+
+                    pages += 1
 
                     for adv in advisories:
                         ghsa_id = adv.get("ghsa_id", "")
@@ -113,37 +144,69 @@ async def _poll_github_advisories():
 
                             # Check if already quarantined
                             if cache:
-                                cache_key = f"cooling:{our_eco}:{name}"
-                                existing = cache.get(cache_key)
+                                existing = cache.get(f"cooling:{our_eco}:{name}")
                                 if existing == "block":
-                                    continue  # Already handled
+                                    continue
 
-                            # Quarantine it
                             quarantine_package(name, our_eco, f"Malware: {summary[:80]}", ghsa_id)
                             total_new += 1
 
-                    # If we got fewer than 100, we've reached the last page
-                    if len(advisories) < 100:
+                    # Extract cursor from Link header for next page
+                    link_header = resp.headers.get("Link", "")
+                    next_cursor = _extract_cursor(link_header)
+
+                    if next_cursor:
+                        after_cursor = next_cursor
+                        # Save cursor so we can resume if interrupted
+                        if cache:
+                            cache.set(cursor_key, after_cursor)
+                    else:
+                        # No next page — fully synced
+                        if cache:
+                            cache.delete(cursor_key)
                         break
-                    page += 1
+
+                    # If we got fewer than 100, we've reached the end
+                    if len(advisories) < 100:
+                        if cache:
+                            cache.delete(cursor_key)
+                        break
 
                 # Update source timestamp
                 if cache:
-                    cache.set(f"source:github:last_pull", datetime.now(timezone.utc).isoformat())
+                    cache.set("source:github:last_pull", datetime.now(timezone.utc).isoformat())
                     cache.set(f"source:{our_eco}:last_pull", datetime.now(timezone.utc).isoformat())
 
-                log.info(f"Polled {gh_eco}: {total_checked} packages checked across {page} pages, {total_new} new quarantines")
+                log.info(f"Polled {gh_eco}: {total_checked} packages across {pages} pages, {total_new} new quarantines")
+                total_new_all += total_new
 
         except Exception as e:
             log.warning(f"Poll failed for {gh_eco}: {e}")
 
+    return total_new_all
 
-async def _poll_osv_dev():
+
+def _extract_cursor(link_header: str) -> str | None:
+    """Extract the 'after' cursor from GitHub's Link header.
+    
+    Example Link header:
+    <https://api.github.com/advisories?after=Y3Vyc29y...>; rel="next"
+    """
+    import re
+    match = re.search(r'<[^>]*[?&]after=([^&>]+)[^>]*>;\s*rel="next"', link_header)
+    if match:
+        return match.group(1)
+    return None
+
+
+async def _poll_osv_dev() -> int:
     """Fetch recent malware entries from OSV.dev for each ecosystem.
     
     Uses the OSV.dev vuln API to check for recent MAL- entries.
     Since OSV doesn't have a simple 'list recent malware' endpoint,
     we query a range of recent MAL IDs (they're sequential).
+    
+    Returns the number of newly quarantined packages.
     """
     log.info("Polling OSV.dev for new malware...")
 
@@ -198,12 +261,15 @@ async def _poll_osv_dev():
 
     except Exception as e:
         log.warning(f"OSV.dev poll failed: {e}")
+        quarantined_count = 0
 
     # Update all OSV source timestamps
     if cache:
         now = datetime.now(timezone.utc).isoformat()
         for our_eco in osv_ecosystems.values():
             cache.set(f"source:osv:{our_eco}:last_pull", now)
+
+    return quarantined_count
 
 
 @asynccontextmanager

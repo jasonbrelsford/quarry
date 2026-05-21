@@ -658,7 +658,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Quarry — Package and Dependency Proxy</title>
+<title>Quarry — Supply Chain Security Proxy</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#0a0e14;color:#c5cdd8;font-size:13px}
@@ -717,9 +717,9 @@ tr:hover{background:#1c2128}
 </head>
 <body>
 <div class="header">
-  <h1>🛡️ Quarry — Package and Dependency Proxy</h1>
+  <h1>🛡️ Quarry — Supply Chain Security Proxy</h1>
   <div style="display:flex;align-items:center;gap:16px">
-    <span class="meta">v0.4.1</span>
+    <span class="meta">v0.4.5</span>
     <span class="meta" id="last-refresh">Auto-refreshes every 5s</span>
     <button class="btn" onclick="refresh()">↻ Refresh</button>
     <span id="auth-status" style="font-size:12px;color:#8b949e"></span>
@@ -756,6 +756,7 @@ tr:hover{background:#1c2128}
       <option value="block">Blocked only</option>
       <option value="allow">Allowed only</option>
       <option value="override">Overrides only</option>
+      <option value="advisory">Advisory (pre-blocked)</option>
     </select>
     <select id="pkg-eco-filter" onchange="renderPackages()">
       <option value="all">All ecosystems</option>
@@ -817,8 +818,17 @@ tr:hover{background:#1c2128}
   </div>
   <div class="card-body scrollable">
     <table>
-      <thead><tr><th>Time</th><th>Package</th><th>Ecosystem</th><th>Reason</th><th>Advisory</th><th>Deleted</th><th>Blocked</th></tr></thead>
-      <tbody id="q-body"><tr><td colspan="7" class="empty">No quarantine actions yet.</td></tr></tbody>
+      <thead><tr>
+        <th class="sortable" onclick="sortQuarantine('timestamp')">Time <span id="qsort-timestamp">▼</span></th>
+        <th class="sortable" onclick="sortQuarantine('package')">Package <span id="qsort-package"></span></th>
+        <th class="sortable" onclick="sortQuarantine('ecosystem')">Ecosystem <span id="qsort-ecosystem"></span></th>
+        <th>Reason</th>
+        <th class="sortable" onclick="sortQuarantine('advisory_id')">Advisory <span id="qsort-advisory_id"></span></th>
+        <th class="sortable" onclick="sortQuarantine('found')">Found <span id="qsort-found"></span></th>
+        <th>Deleted</th>
+        <th class="sortable" onclick="sortQuarantine('blocked')">Blocked <span id="qsort-blocked"></span></th>
+      </tr></thead>
+      <tbody id="q-body"><tr><td colspan="8" class="empty">No quarantine actions yet.</td></tr></tbody>
     </table>
   </div>
 </div>
@@ -1006,6 +1016,9 @@ let authToken = localStorage.getItem('quarry_token') || null;
 let sortField = null;
 let sortDir = 'asc';
 let holdDays = 14;
+let qSortField = 'timestamp';
+let qSortDir = 'desc';
+let allQuarantineLog = [];
 
 function getAuthHeaders() {
   const h = {};
@@ -1179,17 +1192,8 @@ async function refresh() {
 
     // Quarantine log
     document.getElementById('q-count').textContent = qLog.total || 0;
-    if (qLog.log && qLog.log.length > 0) {
-      document.getElementById('q-body').innerHTML = qLog.log.map(e => `<tr>
-        <td style="white-space:nowrap">${e.timestamp ? timeAgo(e.timestamp) : '—'}</td>
-        <td><strong>${e.package}</strong></td>
-        <td><span class="eco-tag ${e.ecosystem}">${e.ecosystem}</span></td>
-        <td style="max-width:200px;overflow:hidden;text-overflow:ellipsis">${e.reason || '—'}</td>
-        <td><code style="font-size:10px">${e.advisory_id || '—'}</code></td>
-        <td>${e.deleted && e.deleted.length ? '✅ ' + e.deleted.length : '—'}</td>
-        <td>${e.blocked ? '✅' : '❌'}</td>
-      </tr>`).join('');
-    }
+    allQuarantineLog = qLog.log || [];
+    renderQuarantine();
 
     document.getElementById('last-refresh').textContent = 'Updated: ' + new Date().toLocaleTimeString();
   } catch(e) { console.error('Refresh failed:', e); }
@@ -1203,10 +1207,57 @@ function sortPackages(field) {
     sortDir = 'asc';
   }
   // Update sort indicators
-  document.querySelectorAll('th.sortable span').forEach(s => s.textContent = '');
+  document.querySelectorAll('th.sortable span[id^="sort-"]').forEach(s => s.textContent = '');
   const indicator = document.getElementById('sort-' + field);
   if (indicator) indicator.textContent = sortDir === 'asc' ? '▲' : '▼';
   renderPackages();
+}
+
+function sortQuarantine(field) {
+  if (qSortField === field) {
+    qSortDir = qSortDir === 'asc' ? 'desc' : 'asc';
+  } else {
+    qSortField = field;
+    qSortDir = field === 'timestamp' ? 'desc' : 'asc';
+  }
+  document.querySelectorAll('th.sortable span[id^="qsort-"]').forEach(s => s.textContent = '');
+  const indicator = document.getElementById('qsort-' + field);
+  if (indicator) indicator.textContent = qSortDir === 'asc' ? '▲' : '▼';
+  renderQuarantine();
+}
+
+function renderQuarantine() {
+  const sorted = [...allQuarantineLog].sort((a, b) => {
+    let valA, valB;
+    switch (qSortField) {
+      case 'timestamp': valA = a.timestamp || ''; valB = b.timestamp || ''; break;
+      case 'package': valA = a.package || ''; valB = b.package || ''; break;
+      case 'ecosystem': valA = a.ecosystem || ''; valB = b.ecosystem || ''; break;
+      case 'advisory_id': valA = a.advisory_id || ''; valB = b.advisory_id || ''; break;
+      case 'found': valA = (a.deleted && a.deleted.length) ? 1 : 0; valB = (b.deleted && b.deleted.length) ? 1 : 0; break;
+      case 'blocked': valA = a.blocked ? 1 : 0; valB = b.blocked ? 1 : 0; break;
+      default: return 0;
+    }
+    if (typeof valA === 'number') return qSortDir === 'asc' ? valA - valB : valB - valA;
+    const cmp = String(valA).localeCompare(String(valB));
+    return qSortDir === 'asc' ? cmp : -cmp;
+  });
+
+  const tbody = document.getElementById('q-body');
+  if (sorted.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="8" class="empty">No quarantine actions yet.</td></tr>';
+    return;
+  }
+  tbody.innerHTML = sorted.map(e => `<tr>
+    <td style="white-space:nowrap">${e.timestamp ? timeAgo(e.timestamp) : '—'}</td>
+    <td><strong>${e.package}</strong></td>
+    <td><span class="eco-tag ${e.ecosystem}">${e.ecosystem}</span></td>
+    <td style="max-width:200px;overflow:hidden;text-overflow:ellipsis">${e.reason || '—'}</td>
+    <td><code style="font-size:10px">${e.advisory_id || '—'}</code></td>
+    <td>${e.deleted && e.deleted.length ? '<span style="color:#f85149">Yes (Nexus)</span>' : '<span style="color:#484f58">Not cached</span>'}</td>
+    <td>${e.deleted && e.deleted.length ? '✅ ' + e.deleted.length : '—'}</td>
+    <td>${e.blocked ? '✅' : '❌'}</td>
+  </tr>`).join('');
 }
 
 function renderPackages() {
@@ -1215,9 +1266,16 @@ function renderPackages() {
   const ecoFilter = document.getElementById('pkg-eco-filter').value;
 
   let filtered = allPackages;
+
+  // By default, hide advisory-only packages (no requester = never actually requested)
+  if (statusFilter !== 'advisory') {
+    filtered = filtered.filter(p => p.requester || statusFilter === 'all' && p.requester);
+  }
+
   if (filter) filtered = filtered.filter(p => p.package.toLowerCase().includes(filter));
   if (statusFilter !== 'all') {
     if (statusFilter === 'override') filtered = filtered.filter(p => p.override);
+    else if (statusFilter === 'advisory') filtered = allPackages.filter(p => !p.requester);
     else filtered = filtered.filter(p => p.status === statusFilter && !p.override);
   }
   if (ecoFilter !== 'all') filtered = filtered.filter(p => p.ecosystem === ecoFilter);
