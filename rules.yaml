@@ -1,11 +1,11 @@
-# Nexus Cooling Proxy — Package Override Rules
+# Quarry — Package Override Rules
 #
-# These rules take precedence over the cooling period check.
+# These rules take precedence over the hold period check.
 # Changes here persist across Redis restarts and pod migrations.
 # Edit via PR for audit trail.
 #
 # Supported actions:
-#   allow  — always allow, skip cooling period check
+#   allow  — always allow, skip hold period check
 #   block  — always block, regardless of age
 #
 # Fields:

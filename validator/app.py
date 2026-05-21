@@ -1,11 +1,11 @@
 """
-Nexus Cooling Proxy — Validation Service
+Quarry — Validation Service
 
 Checks package publish dates against upstream registries.
 Returns 200 (allow) or 403 (too new) for nginx auth_request.
 
 Override rules are loaded from a YAML file (rules.yaml) which takes
-precedence over the cooling period check. This file persists across
+precedence over the hold period check. This file persists across
 Redis restarts and pod migrations.
 """
 import os
@@ -36,9 +36,9 @@ CACHE_TTL_ALLOWED = 86400      # 24h for "allowed" (stable, won't change)
 CACHE_TTL_ERROR = 300          # 5min for upstream errors (retry soon)
 
 logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s %(levelname)s %(message)s")
-log = logging.getLogger("cooling-proxy")
+log = logging.getLogger("quarry")
 
-app = FastAPI(title="Nexus Cooling Proxy Validator")
+app = FastAPI(title="Quarry Validator")
 
 
 # ── Redis connection ──────────────────────────────────────────────────────
@@ -57,7 +57,7 @@ except Exception:
 class RulesEngine:
     """Loads and checks package override rules from a YAML file.
 
-    Rules take precedence over the cooling period check.
+    Rules take precedence over the hold period check.
     The file is reloaded automatically when modified (checked every 30s).
     """
 
@@ -115,7 +115,7 @@ class RulesEngine:
         Returns:
             "allow" — package is explicitly allowed
             "block" — package is explicitly blocked
-            None    — no override, proceed with normal cooling check
+            None    — no override, proceed with normal hold check
         """
         with self._lock:
             # Check block rules first (block takes priority over allow)
@@ -364,8 +364,8 @@ async def validate(request: Request):
     Priority order:
     1. Bypass token (emergency override)
     2. Rules file (persistent allow/block overrides)
-    3. Redis cache (cached cooling decisions)
-    4. Upstream registry lookup (cooling period check)
+    3. Redis cache (cached hold decisions)
+    4. Upstream registry lookup (hold period check)
     """
     # Check bypass token (env var OR Redis runtime override)
     bypass_token_header = request.headers.get(BYPASS_HEADER)
@@ -400,7 +400,7 @@ async def validate(request: Request):
     if cache and version:
         cache.set(f"version:{ecosystem}:{package}", version)
 
-    # Check rules file overrides (takes precedence over cooling period)
+    # Check rules file overrides (takes precedence over hold period)
     rule_decision = rules.check(ecosystem, package, version)
     if rule_decision == "block":
         log.warning(f"BLOCK (rule override): {ecosystem}/{package}")
@@ -417,7 +417,19 @@ async def validate(request: Request):
         _log_request(ecosystem, package, "allow_rule", request)
         return Response(status_code=200)
 
-    # Check cache first
+    # Check manual override (from dashboard/CLI) — takes precedence over cache
+    if cache:
+        override = cache.get(f"override:{ecosystem}:{package}")
+        if override == "allow":
+            return Response(status_code=200)
+        elif override == "deny":
+            return Response(
+                status_code=403,
+                content=f"Package '{package}' has been manually sealed by an admin.",
+                media_type="text/plain",
+            )
+
+    # Check cache
     if cache:
         cached = cache.get(cache_key)
         if cached == "allow":
@@ -426,7 +438,7 @@ async def validate(request: Request):
             return Response(
                 status_code=403,
                 content=f"Package '{package}' is less than {COOLING_DAYS} days old. "
-                        f"Blocked by cooling period policy.",
+                        f"Blocked by hold period policy.",
                 media_type="text/plain",
             )
 
@@ -470,7 +482,7 @@ async def validate(request: Request):
         )
         return Response(
             status_code=403,
-            content=block_msg + " Blocked by cooling period policy.",
+            content=block_msg + " Blocked by hold period policy.",
             media_type="text/plain",
             headers={"X-Block-Reason": block_msg},
         )
@@ -622,7 +634,7 @@ async def test_lookup(
     """Look up a package's publish date from the upstream registry.
 
     Use this to check how old a package is before testing the proxy.
-    Shows whether the package would be allowed or blocked by the cooling period.
+    Shows whether the package would be allowed or blocked by the hold period.
     """
     publish_date = await get_publish_date(ecosystem.value, package, version)
 
@@ -729,7 +741,7 @@ async def test_simulate(
     if age_days < effective_cooling_days:
         return {
             "decision": "block",
-            "reason": f"Published {age_days:.1f} days ago, cooling period is {effective_cooling_days} days",
+            "reason": f"Published {age_days:.1f} days ago, hold period is {effective_cooling_days} days",
             "uri": uri,
             "source": "upstream_lookup",
             "publish_date": publish_date.isoformat(),
@@ -738,7 +750,7 @@ async def test_simulate(
 
     return {
         "decision": "allow",
-        "reason": f"Published {age_days:.0f} days ago, past {effective_cooling_days}-day cooling period",
+        "reason": f"Published {age_days:.0f} days ago, past {effective_cooling_days}-day hold period",
         "uri": uri,
         "source": "upstream_lookup",
         "publish_date": publish_date.isoformat(),
@@ -786,7 +798,7 @@ async def find_new_packages():
     """Find recently published packages across all ecosystems.
 
     Returns packages published in the last 7 days that WOULD be blocked
-    by the cooling proxy. Useful for finding test candidates.
+    by the Quarry. Useful for finding test candidates.
     """
     results = {"maven": [], "pypi": [], "npm": []}
 

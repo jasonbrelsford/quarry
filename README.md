@@ -1,4 +1,4 @@
-# Nexus Cooling Proxy
+# Quarry
 
 Reverse proxy that sits in front of Nexus and blocks packages published less than 7 days ago.
 Prevents supply chain attacks that exploit the window between package publication and malware detection.
@@ -15,7 +15,7 @@ Developer (pip/npm/mvn) → nginx (auth_request) → validation service → Nexu
 4. Checks decision sources in priority order:
    1. Bypass token (emergency override via header)
    2. Rules file (`rules.yaml` — persistent allow/block overrides)
-   3. Redis cache (cached cooling decisions)
+   3. Redis cache (cached hold decisions)
    4. Upstream registry lookup (npm/PyPI/Maven Central publish date)
 5. If published < 7 days ago → returns 403 (nginx blocks the request)
 6. If published ≥ 7 days ago → returns 200 (nginx forwards to Nexus)
@@ -54,7 +54,7 @@ Environment variables for the validator:
 
 ## Package Override Rules
 
-The `rules.yaml` file defines static allow/block overrides that take precedence over the cooling period check. Changes persist across Redis restarts and pod migrations.
+The `rules.yaml` file defines static allow/block overrides that take precedence over the hold period check. Changes persist across Redis restarts and pod migrations.
 
 ```yaml
 overrides:
@@ -79,7 +79,7 @@ overrides:
 | added_on | No | Date added |
 
 Actions:
-- `allow` — always permit, skip cooling period (useful for internal packages not on public registries)
+- `allow` — always permit, skip hold period (useful for internal packages not on public registries)
 - `block` — always deny, regardless of age (useful for known malware/protestware)
 
 Edit via PR for audit trail.
@@ -187,7 +187,7 @@ All endpoints accept `ecosystem` (npm/pypi/maven) and `package` query parameters
 ## Deployment
 
 ```bash
-helm install nexus-cooling-proxy ./helm \
+helm install quarry ./helm \
   --set nexus.upstream=http://nexus:8081 \
   --set redis.enabled=true \
   --set ingress.host=artifacts.example.com
@@ -207,6 +207,6 @@ Redis is deployed as a StatefulSet with AOF persistence enabled by default. This
 To disable persistence (ephemeral cache only):
 
 ```bash
-helm install nexus-cooling-proxy ./helm \
+helm install quarry ./helm \
   --set redis.persistence.enabled=false
 ```

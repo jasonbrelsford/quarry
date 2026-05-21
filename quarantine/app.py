@@ -38,7 +38,7 @@ GITHUB_WEBHOOK_SECRET = os.environ.get("GITHUB_WEBHOOK_SECRET", "")
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO")
 
 # Max quarantine log entries to keep
-MAX_LOG_ENTRIES = 500
+MAX_LOG_ENTRIES = 5000
 
 # Nexus routing rule name for blocking
 ROUTING_RULE_NAME = "block_malware"
@@ -81,43 +81,58 @@ async def _poll_github_advisories():
 
     for gh_eco, our_eco in ecosystems.items():
         try:
+            page = 1
+            total_checked = 0
+            total_new = 0
             async with httpx.AsyncClient(timeout=30) as client:
-                resp = await client.get(
-                    "https://api.github.com/advisories",
-                    params={"type": "malware", "ecosystem": gh_eco, "per_page": 20},
-                    headers=headers,
-                )
-                if resp.status_code != 200:
-                    log.warning(f"GitHub API returned {resp.status_code} for {gh_eco}")
-                    continue
+                while True:
+                    resp = await client.get(
+                        "https://api.github.com/advisories",
+                        params={"type": "malware", "ecosystem": gh_eco, "per_page": 100, "page": page},
+                        headers=headers,
+                    )
+                    if resp.status_code != 200:
+                        log.warning(f"GitHub API returned {resp.status_code} for {gh_eco} (page {page})")
+                        break
 
-                advisories = resp.json()
-                for adv in advisories:
-                    ghsa_id = adv.get("ghsa_id", "")
-                    summary = adv.get("summary", "")
+                    advisories = resp.json()
+                    if not advisories:
+                        break  # No more pages
 
-                    for vuln in adv.get("vulnerabilities", []):
-                        pkg = vuln.get("package", {})
-                        name = pkg.get("name", "")
-                        if not name:
-                            continue
+                    for adv in advisories:
+                        ghsa_id = adv.get("ghsa_id", "")
+                        summary = adv.get("summary", "")
 
-                        # Check if already quarantined
-                        if cache:
-                            cache_key = f"cooling:{our_eco}:{name}"
-                            existing = cache.get(cache_key)
-                            if existing == "block":
-                                continue  # Already handled
+                        for vuln in adv.get("vulnerabilities", []):
+                            pkg = vuln.get("package", {})
+                            name = pkg.get("name", "")
+                            if not name:
+                                continue
 
-                        # Quarantine it
-                        quarantine_package(name, our_eco, f"Malware: {summary[:80]}", ghsa_id)
+                            total_checked += 1
+
+                            # Check if already quarantined
+                            if cache:
+                                cache_key = f"cooling:{our_eco}:{name}"
+                                existing = cache.get(cache_key)
+                                if existing == "block":
+                                    continue  # Already handled
+
+                            # Quarantine it
+                            quarantine_package(name, our_eco, f"Malware: {summary[:80]}", ghsa_id)
+                            total_new += 1
+
+                    # If we got fewer than 100, we've reached the last page
+                    if len(advisories) < 100:
+                        break
+                    page += 1
 
                 # Update source timestamp
                 if cache:
                     cache.set(f"source:github:last_pull", datetime.now(timezone.utc).isoformat())
                     cache.set(f"source:{our_eco}:last_pull", datetime.now(timezone.utc).isoformat())
 
-                log.info(f"Polled {gh_eco}: {len(advisories)} advisories checked")
+                log.info(f"Polled {gh_eco}: {total_checked} packages checked across {page} pages, {total_new} new quarantines")
 
         except Exception as e:
             log.warning(f"Poll failed for {gh_eco}: {e}")
@@ -602,7 +617,15 @@ async def quarantine_stats():
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "nexus_url": NEXUS_URL, "poll_interval_seconds": POLL_INTERVAL_SECONDS}
+    return {
+        "status": "ok",
+        "nexus_url": NEXUS_URL,
+        "nexus_user": NEXUS_USER or "not configured",
+        "poll_interval_seconds": POLL_INTERVAL_SECONDS,
+        "github_token_configured": bool(GITHUB_TOKEN),
+        "github_webhook_secret_configured": bool(GITHUB_WEBHOOK_SECRET),
+        "redis_connected": cache is not None,
+    }
 
 
 @app.post("/poll")

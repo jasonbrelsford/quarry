@@ -3,7 +3,7 @@ kind: ConfigMap
 metadata:
   name: {{ .Release.Name }}-rules
   labels:
-    app: nexus-cooling-proxy
+    app: quarry
 data:
   rules.yaml: |
 {{ .Files.Get "rules.yaml" | indent 4 }}

@@ -3,16 +3,16 @@ kind: Deployment
 metadata:
   name: {{ .Release.Name }}
   labels:
-    app: nexus-cooling-proxy
+    app: quarry
 spec:
   replicas: {{ .Values.replicaCount }}
   selector:
     matchLabels:
-      app: nexus-cooling-proxy
+      app: quarry
   template:
     metadata:
       labels:
-        app: nexus-cooling-proxy
+        app: quarry
     spec:
       containers:
         # nginx — front door

@@ -1,12 +1,12 @@
-# Nexus Cooling Proxy — Demo Walkthrough
+# Quarry — Demo Walkthrough
 
 Full end-to-end test of all features. Run locally with podman-compose.
 
 ## Prerequisites
 
 ```bash
-# From the nexus-cooling-proxy directory
-cd nexus-cooling-proxy
+# From the quarry directory
+cd quarry
 
 # Make sure podman/docker is running
 podman machine start  # or Docker Desktop
@@ -37,7 +37,7 @@ curl http://localhost:8888/repository/npm-central/ 2>/dev/null | head -5
 # Expected: Nexus HTML response (proves proxy is forwarding)
 ```
 
-## 3. Test Cooling Period — Allow Old Package
+## 3. Test Hold Period — Allow Old Package
 
 ```bash
 # express was published in 2010 — well past 7 days
@@ -49,7 +49,7 @@ curl -s -o /dev/null -w "%{http_code}" "http://localhost:8888/repository/pypi-pr
 # Expected: 200
 ```
 
-## 4. Test Cooling Period — Block New Package
+## 4. Test Hold Period — Block New Package
 
 Find a package published in the last 7 days (check https://www.npmjs.com/search?ranking=maintenance&q=published-today or use a known-new one):
 
@@ -57,7 +57,7 @@ Find a package published in the last 7 days (check https://www.npmjs.com/search?
 # Replace with an actually-new package if needed
 # This will likely be blocked if published < 7 days ago:
 curl -s -w "\nHTTP_CODE: %{http_code}\n" http://localhost:8888/repository/npm-central/some-brand-new-package-2026
-# Expected: 403 with message about cooling period
+# Expected: 403 with message about hold period
 ```
 
 If you can't find a new package, temporarily set COOLING_DAYS=99999 to force everything to be "too new":
@@ -66,7 +66,7 @@ If you can't find a new package, temporarily set COOLING_DAYS=99999 to force eve
 # Stop the stack, edit docker-compose.yml: COOLING_DAYS: "99999"
 # Restart, then:
 curl -s -w "\nHTTP_CODE: %{http_code}\n" http://localhost:8888/repository/npm-central/express
-# Expected: 403 (even express is "too new" with 99999 day cooling)
+# Expected: 403 (even express is "too new" with 99999 day hold)
 # Don't forget to set it back to 7!
 ```
 
@@ -163,9 +163,9 @@ You should see:
 - Real-time request log showing all the requests you just made
 - Allow/block decisions with timestamps
 - Package names, ecosystems, source IPs
-- Rule-based blocks show as "block_rule" vs cooling-based "block"
+- Rule-based blocks show as "block_rule" vs hold-based "block"
 
-When logged in, an **Admin Settings** panel appears below the request log. From there you can adjust cooling period, bypass token, log level, fail-open behavior, and cache TTLs — all without redeploying. Changes take effect immediately and are recorded in the audit log shown at the bottom of the panel. (See also §15 for the equivalent API.)
+When logged in, an **Admin Settings** panel appears below the request log. From there you can adjust hold period, bypass token, log level, fail-open behavior, and cache TTLs — all without redeploying. Changes take effect immediately and are recorded in the audit log shown at the bottom of the panel. (See also §15 for the equivalent API.)
 
 ## 11. Check Stats & Rules API
 
@@ -221,7 +221,7 @@ Add to your `~/.m2/settings.xml` or project `pom.xml`:
 ```xml
 <repositories>
   <repository>
-    <id>cooling-proxy</id>
+    <id>quarry</id>
     <url>http://localhost:8888/repository/maven-central/</url>
   </repository>
 </repositories>
@@ -346,7 +346,7 @@ podman-compose down -v  # -v removes the redis volume too
 
 ## Appendix: Find Recently Published Packages (for testing blocks)
 
-Use these commands to find packages published in the last 7 days that the cooling proxy WOULD block.
+Use these commands to find packages published in the last 7 days that the Quarry WOULD block.
 
 ### Maven — Find new artifacts
 
@@ -368,7 +368,7 @@ for doc in data.get('response', {}).get('docs', []):
 "
 ```
 
-Then add the blocked artifact to `nexus-cooling-proxy-maven-app/pom.xml`:
+Then add the blocked artifact to `quarry-maven-app/pom.xml`:
 
 ```xml
 <dependency>
@@ -384,9 +384,9 @@ Test it:
 # Clear local cache so Maven must fetch through proxy
 rm -rf ~/.m2/repository/org/apache/cxf
 
-# Build — should FAIL with 403 from cooling proxy
-mvn clean package -f nexus-cooling-proxy-maven-app/pom.xml \
-  -s nexus-cooling-proxy-maven-app/.mvn/settings.xml
+# Build — should FAIL with 403 from Quarry
+mvn clean package -f quarry-maven-app/pom.xml \
+  -s quarry-maven-app/.mvn/settings.xml
 
 # Expected error: "Could not resolve dependencies... status code: 403"
 ```
@@ -411,7 +411,7 @@ Test it:
 ```bash
 # Try to install a brand-new PyPI package through the proxy
 pip install --index-url http://localhost:8888/repository/pypi-proxy/simple/ <new-package-name>
-# Expected: 403 blocked by cooling period
+# Expected: 403 blocked by hold period
 ```
 
 ### npm — Find new packages
@@ -436,7 +436,7 @@ Test it:
 ```bash
 # Configure npm to use proxy and try a new package
 npm --registry http://localhost:8888/repository/npm-central/ install <new-package-name>
-# Expected: 403 blocked by cooling period
+# Expected: 403 blocked by hold period
 ```
 
 ### All-in-one: Find blockable packages across all ecosystems
@@ -471,7 +471,7 @@ for item in items:
 Once you find a package published < 7 days ago, add it to the pom:
 
 ```xml
-<!-- Add inside <dependencies> in nexus-cooling-proxy-maven-app/pom.xml -->
+<!-- Add inside <dependencies> in quarry-maven-app/pom.xml -->
 <!-- Replace with whatever the "all-in-one" script found -->
 <dependency>
     <groupId>org.apache.cxf.build-utils</groupId>
@@ -486,13 +486,13 @@ Then run:
 # IMPORTANT: clear local Maven cache for this artifact first
 rm -rf ~/.m2/repository/org/apache/cxf
 
-# Build through the cooling proxy
-mvn clean package -f nexus-cooling-proxy-maven-app/pom.xml \
-  -s nexus-cooling-proxy-maven-app/.mvn/settings.xml
+# Build through the Quarry
+mvn clean package -f quarry-maven-app/pom.xml \
+  -s quarry-maven-app/.mvn/settings.xml
 
 # Should fail with 403. Then test bypass (use the bypass settings file):
-mvn clean package -f nexus-cooling-proxy-maven-app/pom.xml \
-  -s nexus-cooling-proxy-maven-app/.mvn/settings-bypass.xml
+mvn clean package -f quarry-maven-app/pom.xml \
+  -s quarry-maven-app/.mvn/settings-bypass.xml
 ```
 
 ---

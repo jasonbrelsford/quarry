@@ -1,5 +1,5 @@
 """
-Nexus Cooling Proxy — Comprehensive Security Dashboard
+Quarry — Comprehensive Security Dashboard
 
 Features:
 - All package requests logged with allow/block status
@@ -8,7 +8,8 @@ Features:
 - Bypass token management info
 - Source pull timestamps
 - Explanatory tooltips for all sections
-- LDAP authentication (LDAP admin group)
+- Session-based authentication with 8-hour expiry
+- Two roles: admin (full access), viewer (read-only)
 """
 import base64
 import json
@@ -17,8 +18,8 @@ import secrets
 from datetime import datetime, timezone
 
 import redis
-from fastapi import FastAPI, Request, HTTPException, Depends
-from fastapi.responses import HTMLResponse, Response
+from fastapi import FastAPI, Request, HTTPException, Depends, Cookie
+from fastapi.responses import HTMLResponse, Response, JSONResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 
 REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379")
@@ -31,8 +32,11 @@ LDAP_USER_GROUP = os.environ.get("LDAP_USER_GROUP", "users")
 LDAP_BASE_DN = os.environ.get("LDAP_BASE_DN", "DC=example,DC=com")
 AUTH_ENABLED = os.environ.get("AUTH_ENABLED", "true").lower() == "true"
 VALIDATOR_URL = os.environ.get("VALIDATOR_URL", "http://validator:8080")
+QUARANTINE_URL = os.environ.get("QUARANTINE_URL", "http://quarantine:8090")
+RULES_REPO_URL = os.environ.get("RULES_REPO_URL", "")  # e.g. https://gitlab.com/bethematch/dcs/devops/automation/quarry
+SESSION_TTL = int(os.environ.get("SESSION_TTL", "28800"))  # 8 hours in seconds
 
-app = FastAPI(title="Nexus Cooling Proxy Dashboard")
+app = FastAPI(title="Quarry Dashboard")
 security = HTTPBasic(auto_error=False)
 
 try:
@@ -40,6 +44,42 @@ try:
     cache.ping()
 except Exception:
     cache = None
+
+
+# ── Session Management ────────────────────────────────────────────────────
+
+def create_session(username: str, role: str) -> str:
+    """Create a session token stored in Redis with TTL."""
+    token = secrets.token_urlsafe(32)
+    session_data = json.dumps({"user": username, "role": role, "created": datetime.now(timezone.utc).isoformat()})
+    if cache:
+        cache.setex(f"session:{token}", SESSION_TTL, session_data)
+    return token
+
+
+def get_session(token: str) -> dict | None:
+    """Get session data from Redis. Returns None if expired or invalid."""
+    if not cache or not token:
+        return None
+    data = cache.get(f"session:{token}")
+    if data:
+        return json.loads(data)
+    return None
+
+
+def destroy_session(token: str):
+    """Delete a session from Redis."""
+    if cache and token:
+        cache.delete(f"session:{token}")
+
+
+def get_session_from_request(request: Request) -> dict | None:
+    """Extract session from Authorization header (Bearer token)."""
+    auth = request.headers.get("Authorization", "")
+    if auth.startswith("Bearer "):
+        token = auth[7:]
+        return get_session(token)
+    return None
 
 
 # ── LDAP Authentication ───────────────────────────────────────────────────
@@ -105,52 +145,119 @@ def verify_ldap_credentials(username: str, password: str) -> str | None:
 
 
 def get_current_user(request: Request, credentials: HTTPBasicCredentials = Depends(security)):
-    """Validate credentials. Returns (username, role) tuple or raises 401.
-    Auth is always required — no anonymous access.
-    """
+    """Get user from session token. Returns dict with user/role or None."""
     if not AUTH_ENABLED:
-        return "anonymous"
+        return {"user": "anonymous", "role": "admin"}
 
-    if not credentials:
-        raise HTTPException(
-            status_code=401,
-            detail="Authentication required",
-            headers={"WWW-Authenticate": 'Basic realm="Nexus Cooling Proxy Dashboard"'},
-        )
+    session = get_session_from_request(request)
+    if session:
+        return session
+    return None
 
-    role = verify_ldap_credentials(credentials.username, credentials.password)
-    if role:
-        return credentials.username
 
-    raise HTTPException(
-        status_code=401,
-        detail="Invalid credentials",
-        headers={"WWW-Authenticate": 'Basic realm="Nexus Cooling Proxy Dashboard"'},
-    )
+def require_admin(request: Request):
+    """Require admin role. Raises 403 if not admin."""
+    session = get_session_from_request(request)
+    if not AUTH_ENABLED:
+        return {"user": "anonymous", "role": "admin"}
+    if not session:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    if session.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Admin access required")
+    return session
 
 
 # ── API Endpoints ─────────────────────────────────────────────────────────
 
 @app.get("/", response_class=HTMLResponse)
 async def dashboard():
-    """Serve the dashboard HTML. Auth is handled client-side via JS."""
-    return DASHBOARD_HTML
+    """Serve the dashboard HTML."""
+    return HTMLResponse(content=DASHBOARD_HTML, headers={"Cache-Control": "no-cache, no-store, must-revalidate"})
+
+
+@app.post("/api/auth/login")
+async def login(request: Request):
+    """Authenticate and create a session. Returns a bearer token."""
+    body = await request.json()
+    username = body.get("username", "")
+    password = body.get("password", "")
+
+    if not username or not password:
+        raise HTTPException(status_code=400, detail="Username and password required")
+
+    role = verify_ldap_credentials(username, password)
+    if not role:
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+
+    token = create_session(username, role)
+    return {"token": token, "user": username, "role": role, "expires_in": SESSION_TTL}
+
+
+@app.post("/api/auth/logout")
+async def logout(request: Request):
+    """Destroy the current session."""
+    auth = request.headers.get("Authorization", "")
+    if auth.startswith("Bearer "):
+        destroy_session(auth[7:])
+    return {"status": "ok"}
 
 
 @app.get("/api/auth/status")
-async def auth_status(credentials: HTTPBasicCredentials = Depends(security)):
-    """Check if the user is authenticated and determine their role."""
+async def auth_status(request: Request):
+    """Check if the current session is valid."""
     if not AUTH_ENABLED:
         return {"authenticated": True, "user": "admin (auth disabled)", "role": "admin"}
 
-    if not credentials:
-        return {"authenticated": False, "user": None, "role": "none"}
-
-    role = verify_ldap_credentials(credentials.username, credentials.password)
-    if role:
-        return {"authenticated": True, "user": credentials.username, "role": role}
+    session = get_session_from_request(request)
+    if session:
+        return {"authenticated": True, "user": session["user"], "role": session["role"]}
 
     return {"authenticated": False, "user": None, "role": "none"}
+
+
+@app.post("/api/cache/clear-allowed")
+async def clear_allowed_cache(request: Request):
+    """Clear all cached 'allowed' decisions. Forces re-evaluation on next request."""
+    session = get_session_from_request(request)
+    if AUTH_ENABLED and (not session or session.get("role") != "admin"):
+        raise HTTPException(status_code=403, detail="Admin access required")
+    if not cache:
+        raise HTTPException(status_code=503, detail="Redis unavailable")
+
+    keys = cache.keys("cooling:*")
+    cleared = 0
+    for k in keys:
+        if cache.get(k) == "allow":
+            cache.delete(k)
+            cleared += 1
+
+    # Audit log
+    user = session.get("user", "unknown") if session else "unknown"
+    audit_entry = json.dumps({
+        "user": user,
+        "action": "clear_allowed_cache",
+        "cleared": cleared,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    })
+    cache.lpush("audit:log", audit_entry)
+    cache.ltrim("audit:log", 0, 199)
+
+    return {"status": "ok", "cleared": cleared}
+
+
+@app.get("/api/nexus-url")
+async def get_nexus_url():
+    """Return the Nexus base URL for package links."""
+    # Query quarantine service for the real Nexus URL
+    try:
+        import httpx
+        async with httpx.AsyncClient(timeout=5) as client:
+            resp = await client.get(f"{QUARANTINE_URL}/health")
+            if resp.status_code == 200:
+                return {"url": resp.json().get("nexus_url", "")}
+    except Exception:
+        pass
+    return {"url": ""}
 
 
 @app.get("/api/packages")
@@ -190,9 +297,10 @@ async def list_packages():
 
 
 @app.post("/api/packages/override")
-async def override_package(request: Request, user: str = Depends(get_current_user)):
+async def override_package(request: Request):
     """Allow or deny a specific package (admin override). Requires admin group membership."""
-    if AUTH_ENABLED and user == "anonymous":
+    session = get_session_from_request(request)
+    if AUTH_ENABLED and (not session or session.get("role") != "admin"):
         raise HTTPException(status_code=403, detail="Admin access required. Login with your credentials (admin group).")
     if not cache:
         raise HTTPException(status_code=503, detail="Redis unavailable")
@@ -210,17 +318,33 @@ async def override_package(request: Request, user: str = Depends(get_current_use
     cache_key = f"cooling:{ecosystem}:{package}"
     override_key = f"override:{ecosystem}:{package}"
 
+    OVERRIDE_TTL = int(os.environ.get("OVERRIDE_TTL", "86400"))  # 24 hours default
+
     if action == "allow":
-        cache.setex(cache_key, 86400 * 365, "allow")
-        cache.set(override_key, "allow")
+        cache.setex(cache_key, OVERRIDE_TTL, "allow")
+        cache.setex(override_key, OVERRIDE_TTL, "allow")
     elif action == "deny":
-        cache.setex(cache_key, 86400 * 365, "block")
-        cache.set(override_key, "deny")
+        cache.setex(cache_key, OVERRIDE_TTL, "block")
+        cache.setex(override_key, OVERRIDE_TTL, "deny")
     elif action == "clear":
         cache.delete(cache_key)
         cache.delete(override_key)
 
-    return {"status": "ok", "package": package, "ecosystem": ecosystem, "action": action}
+    # Log the override with expiry info
+    user = session.get("user", "unknown") if session else "unknown"
+    audit_entry = json.dumps({
+        "user": user,
+        "action": f"override_{action}",
+        "package": package,
+        "ecosystem": ecosystem,
+        "expires_in_hours": OVERRIDE_TTL // 3600,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    })
+    if cache:
+        cache.lpush("audit:log", audit_entry)
+        cache.ltrim("audit:log", 0, 199)
+
+    return {"status": "ok", "package": package, "ecosystem": ecosystem, "action": action, "expires_in_hours": OVERRIDE_TTL // 3600}
 
 
 @app.get("/api/quarantine/log")
@@ -285,7 +409,7 @@ async def validator_stats():
     keys = cache.keys("cooling:*")
     allowed = sum(1 for k in keys if cache.get(k) == "allow")
     blocked = sum(1 for k in keys if cache.get(k) == "block")
-    return {"cached_decisions": len(keys), "allowed": allowed, "blocked": blocked, "cooling_days": 7}
+    return {"cached_decisions": len(keys), "allowed": allowed, "blocked": blocked, "cooling_days": int(cache.get("settings:cooling_days") or 7)}
 
 
 @app.get("/api/requests")
@@ -319,9 +443,10 @@ SETTINGS_DEFAULTS = {
 
 
 @app.get("/api/settings")
-async def get_settings(user: str = Depends(get_current_user)):
+async def get_settings(request: Request):
     """Get all runtime settings. Requires admin login."""
-    if AUTH_ENABLED and user == "anonymous":
+    session = get_session_from_request(request)
+    if AUTH_ENABLED and (not session or session.get("role") != "admin"):
         raise HTTPException(status_code=403, detail="Admin access required")
 
     settings = {}
@@ -333,13 +458,14 @@ async def get_settings(user: str = Depends(get_current_user)):
 
 
 @app.post("/api/settings")
-async def update_settings(request: Request, user: str = Depends(get_current_user)):
+async def update_settings(request: Request):
     """Update runtime settings. Requires admin login.
 
     The validator watches Redis for settings changes and applies them
     without restart. Changes are logged for audit.
     """
-    if AUTH_ENABLED and user == "anonymous":
+    session = get_session_from_request(request)
+    if AUTH_ENABLED and (not session or session.get("role") != "admin"):
         raise HTTPException(status_code=403, detail="Admin access required. Login with your credentials (admin group).")
     if not cache:
         raise HTTPException(status_code=503, detail="Redis unavailable")
@@ -365,7 +491,7 @@ async def update_settings(request: Request, user: str = Depends(get_current_user
     # Audit log
     if updated:
         audit_entry = json.dumps({
-            "user": user,
+            "user": session.get("user", "unknown"),
             "action": "settings_update",
             "changes": updated,
             "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -377,9 +503,10 @@ async def update_settings(request: Request, user: str = Depends(get_current_user
 
 
 @app.get("/api/settings/audit")
-async def settings_audit(user: str = Depends(get_current_user)):
+async def settings_audit(request: Request):
     """Get audit log of settings changes. Requires admin login."""
-    if AUTH_ENABLED and user == "anonymous":
+    session = get_session_from_request(request)
+    if AUTH_ENABLED and (not session or session.get("role") != "admin"):
         raise HTTPException(status_code=403, detail="Admin access required")
     if not cache:
         return {"log": []}
@@ -402,10 +529,110 @@ async def get_rules():
     return {"allow": [], "block": [], "error": "Could not reach validator"}
 
 
+@app.get("/api/admin/config")
+async def get_admin_config(request: Request):
+    """Return read-only administration configuration for the admin panel."""
+    session = get_session_from_request(request)
+    if AUTH_ENABLED and (not session or session.get("role") != "admin"):
+        raise HTTPException(status_code=403, detail="Admin access required")
+
+    # Query quarantine service for its status
+    quarantine_info = {}
+    try:
+        import httpx
+        async with httpx.AsyncClient(timeout=5) as client:
+            resp = await client.get(f"{QUARANTINE_URL}/health")
+            if resp.status_code == 200:
+                quarantine_info = resp.json()
+    except Exception:
+        pass
+
+    github_auth = "token" if quarantine_info.get("github_token_configured") else "none (rate limited)"
+    poll_interval = quarantine_info.get("poll_interval_seconds", 3600)
+
+    return {
+        "security": {
+            "ldap_uri": LDAP_URI,
+            "ldap_domain": LDAP_DOMAIN,
+            "ldap_admin_group": LDAP_ADMIN_GROUP,
+            "ldap_user_group": LDAP_USER_GROUP,
+            "ldap_base_dn": LDAP_BASE_DN,
+            "auth_enabled": AUTH_ENABLED,
+            "session_ttl": f"{SESSION_TTL // 3600}h ({SESSION_TTL}s)",
+            "override_ttl": f"{int(os.environ.get('OVERRIDE_TTL', '86400')) // 3600}h ({os.environ.get('OVERRIDE_TTL', '86400')}s)",
+        },
+        "data_sources": [
+            {"name": "GitHub Advisory DB", "type": "malware", "poll_interval": f"{poll_interval // 60}m", "auth": github_auth},
+            {"name": "OSV.dev (npm)", "type": "malware", "poll_interval": f"{poll_interval // 60}m", "auth": "public API"},
+            {"name": "OSV.dev (PyPI)", "type": "malware", "poll_interval": f"{poll_interval // 60}m", "auth": "public API"},
+            {"name": "OSV.dev (Maven)", "type": "malware", "poll_interval": f"{poll_interval // 60}m", "auth": "public API"},
+            {"name": "npm Registry", "type": "age lookup", "poll_interval": "on-demand", "auth": "public API"},
+            {"name": "PyPI Registry", "type": "age lookup", "poll_interval": "on-demand", "auth": "public API"},
+            {"name": "Maven Central", "type": "age lookup", "poll_interval": "on-demand", "auth": "public API"},
+        ],
+        "integration": {
+            "nexus_url": quarantine_info.get("nexus_url", "not configured"),
+            "nexus_user": quarantine_info.get("nexus_user", "not configured"),
+            "rules_repo": RULES_REPO_URL or "not configured",
+            "redis_url": REDIS_URL,
+        },
+    }
+
+
+@app.get("/api/rules/mr-url")
+async def get_mr_url(ecosystem: str, package: str, action: str, reason: str = ""):
+    """Generate a URL to create a merge request that adds a rule to rules.yaml.
+
+    Opens in the user's browser — uses their own GitLab/GitHub auth.
+    No server-side token needed.
+    """
+    if not RULES_REPO_URL:
+        return {"url": None, "error": "RULES_REPO_URL not configured"}
+
+    # Build the YAML snippet to add
+    from datetime import date
+    entry = f'    - package: "{package}"\n      ecosystem: {ecosystem}\n      reason: "{reason or "Emergency override from dashboard"}"\n      added_on: "{date.today().isoformat()}"'
+
+    section = "block" if action == "deny" else "allow"
+
+    # Detect GitLab vs GitHub from URL
+    repo_url = RULES_REPO_URL.rstrip("/")
+
+    if "gitlab" in repo_url:
+        # GitLab Web IDE edit URL with pre-filled content
+        # Opens the file editor on a new branch
+        branch_name = f"quarry/{action}-{ecosystem}-{package.replace('/', '-').replace(':', '-')}"
+        edit_url = f"{repo_url}/-/edit/main/rules.yaml?branch_name={branch_name}&commit_message=quarry: {action} {ecosystem}/{package}"
+        mr_url = f"{repo_url}/-/merge_requests/new?merge_request[source_branch]={branch_name}&merge_request[target_branch]=main&merge_request[title]=quarry: {action} {ecosystem}/{package}"
+        return {
+            "edit_url": edit_url,
+            "mr_url": mr_url,
+            "snippet": entry,
+            "section": section,
+            "instructions": f"Add this under 'overrides: {section}:' in rules.yaml",
+        }
+    elif "github" in repo_url:
+        # GitHub edit URL
+        # Extract owner/repo from URL
+        parts = repo_url.replace("https://github.com/", "").split("/")
+        if len(parts) >= 2:
+            owner, repo = parts[0], parts[1]
+            edit_url = f"https://github.com/{owner}/{repo}/edit/main/rules.yaml"
+            return {
+                "edit_url": edit_url,
+                "snippet": entry,
+                "section": section,
+                "instructions": f"Add this under 'overrides: {section}:' in rules.yaml",
+            }
+
+    return {"url": None, "error": "Unsupported repository platform"}
+
+
 @app.post("/api/token/generate")
-async def generate_token(user: str = Depends(get_current_user)):
+async def generate_token(request: Request):
     """Generate a new random bypass token and store it in Redis."""
-    if AUTH_ENABLED and user == "anonymous":
+    session = get_session_from_request(request)
+    if AUTH_ENABLED and (not session or session.get("role") != "admin"):
         raise HTTPException(status_code=403, detail="Admin access required")
     if not cache:
         raise HTTPException(status_code=503, detail="Redis unavailable")
@@ -415,7 +642,7 @@ async def generate_token(user: str = Depends(get_current_user)):
 
     # Audit log
     audit_entry = json.dumps({
-        "user": user,
+        "user": session.get("user", "unknown"),
         "action": "token_generated",
         "timestamp": datetime.now(timezone.utc).isoformat(),
     })
@@ -431,7 +658,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Nexus Cooling Proxy — Security Dashboard</title>
+<title>Quarry — Package and Dependency Proxy</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#0a0e14;color:#c5cdd8;font-size:13px}
@@ -490,8 +717,9 @@ tr:hover{background:#1c2128}
 </head>
 <body>
 <div class="header">
-  <h1>🛡️ Nexus Cooling Proxy — Security Dashboard</h1>
+  <h1>🛡️ Quarry — Package and Dependency Proxy</h1>
   <div style="display:flex;align-items:center;gap:16px">
+    <span class="meta">v0.4.1</span>
     <span class="meta" id="last-refresh">Auto-refreshes every 5s</span>
     <button class="btn" onclick="refresh()">↻ Refresh</button>
     <span id="auth-status" style="font-size:12px;color:#8b949e"></span>
@@ -504,7 +732,7 @@ tr:hover{background:#1c2128}
 
 <!-- Metrics -->
 <div class="metrics-row">
-  <div class="metric-card"><div class="metric-value green" id="m-allowed">0</div><div class="metric-label">Allowed (passed cooling)</div></div>
+  <div class="metric-card"><div class="metric-value green" id="m-allowed">0</div><div class="metric-label">Allowed (passed hold period)</div></div>
   <div class="metric-card"><div class="metric-value orange" id="m-cooling">0</div><div class="metric-label">Blocked (< 7 days old)</div></div>
   <div class="metric-card"><div class="metric-value red" id="m-quarantined">0</div><div class="metric-label">Quarantined (malware)</div></div>
   <div class="metric-card"><div class="metric-value purple" id="m-overrides">0</div><div class="metric-label">Manual Overrides</div></div>
@@ -535,9 +763,10 @@ tr:hover{background:#1c2128}
       <option value="pip">PyPI</option>
       <option value="maven">Maven</option>
     </select>
+    <button class="btn btn-deny btn-sm" onclick="clearAllowedCache()" title="Clear all cached 'allowed' decisions — forces re-evaluation on next request">🗑 Clear Allowed Cache</button>
   </div>
   <div class="info-box">
-    <strong>How it works:</strong> Every dependency request passes through the cooling proxy. Packages published less than 7 days ago are automatically blocked.
+    <strong>How it works:</strong> Every dependency request passes through Quarry. Packages published less than 7 days ago are automatically blocked.
     Known malware (from GitHub Advisory DB / OSV.dev) is permanently blocked and removed from Nexus.
     Use the <strong>Allow</strong> button to override a block for urgent needs, or <strong>Deny</strong> to permanently block a package.
   </div>
@@ -549,7 +778,7 @@ tr:hover{background:#1c2128}
         <th class="sortable" onclick="sortPackages('ecosystem')">Ecosystem <span id="sort-ecosystem"></span></th>
         <th class="sortable" onclick="sortPackages('age')">Age <span id="sort-age"></span></th>
         <th class="sortable" onclick="sortPackages('status')">Status <span id="sort-status"></span></th>
-        <th>Last Requested By</th>
+        <th class="sortable" onclick="sortPackages('requester')">Last Requested By <span id="sort-requester"></span></th>
         <th class="sortable" onclick="sortPackages('override')">Override <span id="sort-override"></span></th>
         <th>Actions</th>
       </tr></thead>
@@ -566,7 +795,7 @@ tr:hover{background:#1c2128}
   </div>
 
   <div class="card">
-    <div class="card-title">Bypass Info <span class="tooltip" data-tip="How developers can bypass the cooling period for urgent needs">ⓘ</span></div>
+    <div class="card-title">Bypass Info <span class="tooltip" data-tip="How developers can bypass the hold period for urgent needs">ⓘ</span></div>
     <div class="info-box" style="margin:0;border:none;border-radius:0">
       <strong>For developers who need a new package immediately:</strong><br><br>
       1. Contact DevOps to request alternate methods.<br><br>
@@ -603,9 +832,9 @@ tr:hover{background:#1c2128}
   <div class="card-body" style="padding:16px">
     <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px">
       <div>
-        <label style="font-size:11px;color:#8b949e;display:block;margin-bottom:4px">Cooling Period (days)</label>
+        <label style="font-size:11px;color:#8b949e;display:block;margin-bottom:4px">Hold Period (days)</label>
         <input type="number" id="set-cooling-days" class="setting-input" min="0" max="99999" style="width:100%;background:#0d1117;border:1px solid #30363d;color:#c5cdd8;padding:8px 12px;border-radius:4px;font-size:14px">
-        <span style="font-size:10px;color:#484f58">How many days a package must exist before it's allowed. Set to 0 to disable cooling.</span>
+        <span style="font-size:10px;color:#484f58">How many days a package must exist before it's allowed. Set to 0 to disable the hold.</span>
       </div>
       <div>
         <label style="font-size:11px;color:#8b949e;display:block;margin-bottom:4px">Bypass Token</label>
@@ -658,14 +887,111 @@ tr:hover{background:#1c2128}
   </div>
 </div>
 
+<!-- Administration Panel (read-only, visible when logged in) -->
+<div class="card" id="admin-panel" style="margin-top:16px;display:none">
+  <div class="card-title">
+    🔐 Administration
+    <span class="info">Security configuration and data source management (read-only)</span>
+  </div>
+  <div class="card-body" style="padding:16px">
+
+    <!-- Security Section -->
+    <div style="margin-bottom:24px">
+      <h3 style="color:#e6edf3;font-size:13px;margin-bottom:12px;border-bottom:1px solid #1e2a3a;padding-bottom:8px">Security & Access Control</h3>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px">
+        <div>
+          <label style="font-size:11px;color:#8b949e;display:block;margin-bottom:4px">LDAP Server</label>
+          <div id="admin-ldap-uri" style="background:#0d1117;border:1px solid #30363d;padding:8px 12px;border-radius:4px;font-size:12px;color:#79c0ff"></div>
+        </div>
+        <div>
+          <label style="font-size:11px;color:#8b949e;display:block;margin-bottom:4px">Domain</label>
+          <div id="admin-ldap-domain" style="background:#0d1117;border:1px solid #30363d;padding:8px 12px;border-radius:4px;font-size:12px;color:#79c0ff"></div>
+        </div>
+        <div>
+          <label style="font-size:11px;color:#8b949e;display:block;margin-bottom:4px">Admin Group</label>
+          <div id="admin-ldap-admin-group" style="background:#0d1117;border:1px solid #30363d;padding:8px 12px;border-radius:4px;font-size:12px;color:#79c0ff"></div>
+          <span style="font-size:10px;color:#484f58">Full read/write access to dashboard, overrides, and settings</span>
+        </div>
+        <div>
+          <label style="font-size:11px;color:#8b949e;display:block;margin-bottom:4px">Viewer Group</label>
+          <div id="admin-ldap-user-group" style="background:#0d1117;border:1px solid #30363d;padding:8px 12px;border-radius:4px;font-size:12px;color:#79c0ff"></div>
+          <span style="font-size:10px;color:#484f58">Read-only access to dashboard and request log</span>
+        </div>
+        <div>
+          <label style="font-size:11px;color:#8b949e;display:block;margin-bottom:4px">Base DN</label>
+          <div id="admin-ldap-base-dn" style="background:#0d1117;border:1px solid #30363d;padding:8px 12px;border-radius:4px;font-size:12px;color:#79c0ff"></div>
+        </div>
+        <div>
+          <label style="font-size:11px;color:#8b949e;display:block;margin-bottom:4px">Auth Enabled</label>
+          <div id="admin-auth-enabled" style="background:#0d1117;border:1px solid #30363d;padding:8px 12px;border-radius:4px;font-size:12px;color:#79c0ff"></div>
+        </div>
+        <div>
+          <label style="font-size:11px;color:#8b949e;display:block;margin-bottom:4px">Session TTL</label>
+          <div id="admin-session-ttl" style="background:#0d1117;border:1px solid #30363d;padding:8px 12px;border-radius:4px;font-size:12px;color:#79c0ff"></div>
+          <span style="font-size:10px;color:#484f58">How long a login session lasts before re-authentication</span>
+        </div>
+        <div>
+          <label style="font-size:11px;color:#8b949e;display:block;margin-bottom:4px">Override TTL</label>
+          <div id="admin-override-ttl" style="background:#0d1117;border:1px solid #30363d;padding:8px 12px;border-radius:4px;font-size:12px;color:#79c0ff"></div>
+          <span style="font-size:10px;color:#484f58">How long emergency overrides last before auto-expiring</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- Data Sources Section -->
+    <div style="margin-bottom:24px">
+      <h3 style="color:#e6edf3;font-size:13px;margin-bottom:12px;border-bottom:1px solid #1e2a3a;padding-bottom:8px">Data Sources & Advisory Feeds</h3>
+      <table style="width:100%">
+        <thead><tr>
+          <th>Source</th>
+          <th>Status</th>
+          <th>Poll Interval</th>
+          <th>Last Checked</th>
+          <th>Auth</th>
+        </tr></thead>
+        <tbody id="admin-sources-body">
+          <tr><td colspan="5" class="empty">Loading...</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <!-- Repository Integration Section -->
+    <div>
+      <h3 style="color:#e6edf3;font-size:13px;margin-bottom:12px;border-bottom:1px solid #1e2a3a;padding-bottom:8px">Repository Integration</h3>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px">
+        <div>
+          <label style="font-size:11px;color:#8b949e;display:block;margin-bottom:4px">Nexus URL</label>
+          <div id="admin-nexus-url" style="background:#0d1117;border:1px solid #30363d;padding:8px 12px;border-radius:4px;font-size:12px;color:#79c0ff"></div>
+        </div>
+        <div>
+          <label style="font-size:11px;color:#8b949e;display:block;margin-bottom:4px">Nexus User</label>
+          <div id="admin-nexus-user" style="background:#0d1117;border:1px solid #30363d;padding:8px 12px;border-radius:4px;font-size:12px;color:#79c0ff"></div>
+        </div>
+        <div>
+          <label style="font-size:11px;color:#8b949e;display:block;margin-bottom:4px">Rules Repo (MR target)</label>
+          <div id="admin-rules-repo" style="background:#0d1117;border:1px solid #30363d;padding:8px 12px;border-radius:4px;font-size:12px;color:#79c0ff"></div>
+        </div>
+        <div>
+          <label style="font-size:11px;color:#8b949e;display:block;margin-bottom:4px">Redis</label>
+          <div id="admin-redis-url" style="background:#0d1117;border:1px solid #30363d;padding:8px 12px;border-radius:4px;font-size:12px;color:#79c0ff"></div>
+        </div>
+      </div>
+    </div>
+
+    <div style="margin-top:16px;padding:10px;background:#0d1117;border-radius:4px;border:1px solid #30363d">
+      <span style="font-size:11px;color:#8b949e">ℹ️ These values are configured via environment variables. To modify, update the deployment configuration and redeploy.</span>
+    </div>
+  </div>
+</div>
+
 <!-- Legend (bottom) -->
 <div class="card" style="margin-top:16px">
   <div class="card-title">Legend</div>
   <div class="info-box" style="margin:0;border:none;border-radius:0">
-    <span class="status-badge allow">Allowed</span> — Package is older than the cooling period, safe to use<br><br>
+    <span class="status-badge allow">Allowed</span> — Package is older than the hold period, safe to use<br><br>
     <span class="status-badge block">Blocked</span> — Package is too new or known malware<br><br>
     <span class="status-badge override">Override</span> — Admin manually allowed or denied this package<br><br>
-    <strong>Cooling Period:</strong> Configurable (default 7 days) from first publish date on the upstream registry (npm/PyPI/Maven Central)<br><br>
+    <strong>Hold Period:/strong> Configurable (default 7 days) from first publish date on the upstream registry (npm/PyPI/Maven Central)<br><br>
     <strong>Quarantine:</strong> Packages flagged as malware by GitHub Advisory DB or OSV.dev are permanently blocked and deleted from Nexus cache<br><br>
     <strong>Bypass Token:</strong> Stored in Vault (K8s) or Redis (runtime override). If everything goes down, the env var token from Vault still works.
   </div>
@@ -676,130 +1002,138 @@ tr:hover{background:#1c2128}
 <script>
 let allPackages = [];
 let isAdmin = false;
-let authHeader = null;
+let authToken = localStorage.getItem('quarry_token') || null;
 let sortField = null;
 let sortDir = 'asc';
+let holdDays = 14;
+
+function getAuthHeaders() {
+  const h = {};
+  if (authToken) h['Authorization'] = 'Bearer ' + authToken;
+  return h;
+}
 
 async function checkAuth() {
   try {
-    const opts = authHeader ? {headers: {'Authorization': authHeader}} : {};
-    const resp = await fetch('/api/auth/status', opts);
+    const resp = await fetch('/api/auth/status', {headers: getAuthHeaders()});
     const data = await resp.json();
     isAdmin = data.role === 'admin';
     const statusEl = document.getElementById('auth-status');
     const loginBtn = document.getElementById('login-btn');
     const logoutBtn = document.getElementById('logout-btn');
-    const loggedIn = data.authenticated === true;
-    if (data.user && data.user.includes('auth disabled')) {
-      statusEl.textContent = '🔓 Admin (no auth)';
-      statusEl.style.color = '#d29922';
-      loginBtn.style.display = 'none';
-      logoutBtn.style.display = 'none';
-      document.getElementById('settings-panel').style.display = 'block';
-      loadSettings();
-    } else if (loggedIn) {
-      isAdmin = data.role === 'admin';
+
+    if (data.authenticated) {
       statusEl.textContent = '✓ ' + data.user + ' (' + data.role + ')';
       statusEl.style.color = data.role === 'admin' ? '#3fb950' : '#58a6ff';
       loginBtn.style.display = 'none';
       logoutBtn.style.display = 'inline-block';
+      hideLoginOverlay();
       if (data.role === 'admin') {
         document.getElementById('settings-panel').style.display = 'block';
+        document.getElementById('admin-panel').style.display = 'block';
         loadSettings();
+        loadAdminConfig();
       } else {
-        document.getElementById('settings-panel').style.display = 'none';
+        document.getElementById('settings-panel').style.display = 'none'; document.getElementById('admin-panel').style.display = 'none';
       }
     } else {
+      authToken = null;
+      localStorage.removeItem('quarry_token');
       statusEl.textContent = '';
       loginBtn.style.display = 'inline-block';
       logoutBtn.style.display = 'none';
-      document.getElementById('settings-panel').style.display = 'none';
+      document.getElementById('settings-panel').style.display = 'none'; document.getElementById('admin-panel').style.display = 'none';
+      showLoginOverlay();
     }
   } catch(e) {
     isAdmin = false;
-    document.getElementById('login-btn').style.display = 'inline-block';
-    document.getElementById('logout-btn').style.display = 'none';
+    showLoginOverlay();
+  }
+}
+
+function showLoginOverlay() {
+  let overlay = document.getElementById('login-overlay');
+  if (!overlay) {
+    overlay = document.createElement('div');
+    overlay.id = 'login-overlay';
+    overlay.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(10,14,20,0.92);z-index:10000;display:flex;align-items:center;justify-content:center;flex-direction:column;';
+    overlay.innerHTML = `
+      <div style="background:#161b22;border:1px solid #30363d;border-radius:12px;padding:32px;width:340px;text-align:center">
+        <h2 style="color:#e6edf3;font-size:16px;margin-bottom:4px">⛏ Quarry</h2>
+        <p style="color:#8b949e;font-size:12px;margin-bottom:20px">Supply Chain Security Dashboard</p>
+        <div id="login-error" style="color:#f85149;font-size:12px;margin-bottom:12px;display:none"></div>
+        <input type="text" id="login-user" placeholder="Username" style="width:100%;padding:10px 12px;margin-bottom:10px;background:#0d1117;border:1px solid #30363d;border-radius:6px;color:#c5cdd8;font-size:13px">
+        <input type="password" id="login-pass" placeholder="Password" style="width:100%;padding:10px 12px;margin-bottom:16px;background:#0d1117;border:1px solid #30363d;border-radius:6px;color:#c5cdd8;font-size:13px">
+        <button onclick="submitLogin()" style="width:100%;padding:10px;background:#238636;border:none;border-radius:6px;color:#fff;font-size:13px;font-weight:600;cursor:pointer">Sign In</button>
+        <p style="color:#484f58;font-size:10px;margin-top:12px">Session expires after 8 hours</p>
+      </div>
+    `;
+    document.body.appendChild(overlay);
+    // Enter key submits
+    overlay.addEventListener('keydown', function(e) {
+      if (e.key === 'Enter') submitLogin();
+    });
+    // Focus username field
+    setTimeout(() => document.getElementById('login-user').focus(), 100);
+  }
+  overlay.style.display = 'flex';
+}
+
+function hideLoginOverlay() {
+  const overlay = document.getElementById('login-overlay');
+  if (overlay) overlay.style.display = 'none';
+}
+
+async function submitLogin() {
+  const user = document.getElementById('login-user').value.trim();
+  const pass = document.getElementById('login-pass').value;
+  const errEl = document.getElementById('login-error');
+
+  if (!user || !pass) {
+    errEl.textContent = 'Username and password required';
+    errEl.style.display = 'block';
+    return;
+  }
+
+  try {
+    const resp = await fetch('/api/auth/login', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({username: user, password: pass})
+    });
+
+    if (resp.ok) {
+      const data = await resp.json();
+      authToken = data.token;
+      localStorage.setItem('quarry_token', authToken);
+      errEl.style.display = 'none';
+      hideLoginOverlay();
+      checkAuth();
+      renderPackages();
+    } else {
+      const err = await resp.json();
+      errEl.textContent = err.detail || 'Login failed';
+      errEl.style.display = 'block';
+      document.getElementById('login-pass').value = '';
+    }
+  } catch(e) {
+    errEl.textContent = 'Connection error';
+    errEl.style.display = 'block';
   }
 }
 
 function doLogin() {
-  const user = prompt('Username (admin group required):');
-  if (!user) return;
-  // Create a hidden input for password masking
-  const passInput = document.createElement('input');
-  passInput.type = 'password';
-  passInput.style.position = 'fixed';
-  passInput.style.top = '50%';
-  passInput.style.left = '50%';
-  passInput.style.transform = 'translate(-50%, -50%)';
-  passInput.style.padding = '12px 16px';
-  passInput.style.fontSize = '14px';
-  passInput.style.background = '#161b22';
-  passInput.style.border = '1px solid #30363d';
-  passInput.style.borderRadius = '6px';
-  passInput.style.color = '#c5cdd8';
-  passInput.style.width = '300px';
-  passInput.style.zIndex = '10000';
-  passInput.placeholder = 'Password';
-
-  const overlay = document.createElement('div');
-  overlay.style.position = 'fixed';
-  overlay.style.top = '0';
-  overlay.style.left = '0';
-  overlay.style.width = '100%';
-  overlay.style.height = '100%';
-  overlay.style.background = 'rgba(0,0,0,0.7)';
-  overlay.style.zIndex = '9999';
-  overlay.style.display = 'flex';
-  overlay.style.alignItems = 'center';
-  overlay.style.justifyContent = 'center';
-  overlay.style.flexDirection = 'column';
-
-  const label = document.createElement('div');
-  label.textContent = 'Password for ' + user + ':';
-  label.style.color = '#c5cdd8';
-  label.style.marginBottom = '8px';
-  label.style.fontSize = '13px';
-
-  const hint = document.createElement('div');
-  hint.textContent = 'Press Enter to submit, Escape to cancel';
-  hint.style.color = '#484f58';
-  hint.style.marginTop = '8px';
-  hint.style.fontSize = '11px';
-
-  overlay.appendChild(label);
-  overlay.appendChild(passInput);
-  overlay.appendChild(hint);
-  document.body.appendChild(overlay);
-  passInput.focus();
-
-  passInput.addEventListener('keydown', function(e) {
-    if (e.key === 'Enter') {
-      const pass = passInput.value;
-      document.body.removeChild(overlay);
-      if (!pass) return;
-      authHeader = 'Basic ' + btoa(user + ':' + pass);
-      checkAuth().then(() => {
-        const statusEl = document.getElementById('auth-status');
-        if (!statusEl.textContent.includes('✓')) {
-          alert('Login failed. Invalid credentials.');
-          authHeader = null;
-        }
-        renderPackages();
-      });
-    } else if (e.key === 'Escape') {
-      document.body.removeChild(overlay);
-    }
-  });
+  showLoginOverlay();
 }
 
-function doLogout() {
-  authHeader = null;
+async function doLogout() {
+  try {
+    await fetch('/api/auth/logout', {method: 'POST', headers: getAuthHeaders()});
+  } catch(e) {}
+  authToken = null;
+  localStorage.removeItem('quarry_token');
   isAdmin = false;
-  document.getElementById('settings-panel').style.display = 'none';
-  document.getElementById('token-gen-area').innerHTML = '';
-  // Clear browser-cached Basic Auth by sending invalid credentials
-  fetch('/api/auth/status', {headers: {'Authorization': 'Basic ' + btoa('logout:logout')}}).catch(() => {});
+  document.getElementById('settings-panel').style.display = 'none'; document.getElementById('admin-panel').style.display = 'none';
   checkAuth();
   renderPackages();
 }
@@ -825,6 +1159,7 @@ async function refresh() {
     // Metrics
     document.getElementById('m-allowed').textContent = stats.allowed || 0;
     document.getElementById('m-cooling').textContent = stats.blocked || 0;
+    holdDays = stats.cooling_days || 14;
     document.getElementById('m-quarantined').textContent = qStats.total_quarantined || 0;
     const overrides = allPackages.filter(p => p.override).length;
     document.getElementById('m-overrides').textContent = overrides;
@@ -895,9 +1230,10 @@ function renderPackages() {
         case 'package': valA = a.package || ''; valB = b.package || ''; break;
         case 'version': valA = a.version || ''; valB = b.version || ''; break;
         case 'ecosystem': valA = a.ecosystem || ''; valB = b.ecosystem || ''; break;
-        case 'age': valA = a.age_days ?? 99999; valB = b.age_days ?? 99999; break;
+        case 'age': valA = (a.age_days !== null && a.age_days !== undefined) ? a.age_days : 99999; valB = (b.age_days !== null && b.age_days !== undefined) ? b.age_days : 99999; break;
         case 'status': valA = a.status || ''; valB = b.status || ''; break;
         case 'override': valA = a.override || ''; valB = b.override || ''; break;
+        case 'requester': valA = (a.requester && a.requester.source_ip) || ''; valB = (b.requester && b.requester.source_ip) || ''; break;
         default: return 0;
       }
       if (sortField === 'age') {
@@ -918,15 +1254,15 @@ function renderPackages() {
     const statusClass = p.override ? 'override' : p.status;
     const statusText = p.override ? `Override: ${p.override}` : (p.status === 'allow' ? 'Allowed' : 'Blocked');
     const versionHtml = p.version ? `<code style="font-size:11px;color:#79c0ff">${p.version}</code>` : '<span style="color:#484f58;font-size:11px">—</span>';
-    const ageHtml = p.age_days !== null && p.age_days !== undefined
-      ? `<span style="font-weight:600;color:${p.age_days < 7 ? '#f85149' : p.age_days < 14 ? '#d29922' : '#3fb950'}">${p.age_days}d</span>`
+    const ageHtml = p.age_days !== null && p.age_days !== undefined && p.age_days < holdDays
+      ? `<span style="font-weight:600;color:${p.age_days < 7 ? '#f85149' : '#d29922'}">${p.age_days}d</span>`
       : '<span style="color:#484f58;font-size:11px">—</span>';
     const req = p.requester;
     const requesterHtml = req
       ? `<span style="font-size:11px" title="${req.user_agent || ''}">${req.source_ip || '—'}</span><br><span style="font-size:10px;color:#484f58">${req.timestamp ? timeAgo(req.timestamp) : ''}</span>`
       : '<span style="color:#484f58;font-size:11px">—</span>';
     const actions = isAdmin ? `
-        <button class="btn btn-allow btn-sm" onclick="overridePkg('${p.package}','${p.ecosystem}','allow')" title="Allow this package (bypass cooling period)">✓ Allow</button>
+        <button class="btn btn-allow btn-sm" onclick="overridePkg('${p.package}','${p.ecosystem}','allow')" title="Allow this package (bypass hold period)">✓ Allow</button>
         <button class="btn btn-deny btn-sm" onclick="overridePkg('${p.package}','${p.ecosystem}','deny')" title="Permanently block this package">✗ Deny</button>
         ${p.override ? '<button class="btn btn-sm" onclick="overridePkg(\''+p.package+'\',\''+p.ecosystem+'\',\'clear\')" title="Remove override, return to automatic">↺ Clear</button>' : ''}
     ` : '<span style="color:#484f58;font-size:11px">Login to modify</span>';
@@ -943,29 +1279,78 @@ function renderPackages() {
   }).join('');
 }
 
+async function clearAllowedCache() {
+  if (!confirm('Clear all cached "allowed" decisions? Packages will be re-evaluated on next request.\n\nThis is useful for testing — it does NOT block anything permanently.')) return;
+  const headers = {...getAuthHeaders(), 'Content-Type': 'application/json'};
+  const resp = await fetch('/api/cache/clear-allowed', {method: 'POST', headers});
+  if (resp.ok) {
+    const data = await resp.json();
+    alert('Cleared ' + data.cleared + ' cached allowed decisions.');
+    refresh();
+  } else {
+    alert('Failed: ' + await resp.text());
+  }
+}
+
 async function overridePkg(pkg, eco, action) {
   if (!isAdmin) {
     alert('You must be logged in as an admin to modify packages.');
     return;
   }
-  // Only confirm on destructive actions (deny/clear), not allow
+  // Confirm with expiry notice
   if (action === 'deny') {
-    if (!confirm(`Permanently block "${pkg}" (${eco})? No one will be able to download it.`)) return;
+    if (!confirm(`Block "${pkg}" (${eco})? This is a temporary 24-hour emergency override.\nTo make it permanent, create a merge request after.`)) return;
+  } else if (action === 'allow') {
+    if (!confirm(`Allow "${pkg}" (${eco})? This is a temporary 24-hour override.\nTo make it permanent, create a merge request after.`)) return;
   } else if (action === 'clear') {
     if (!confirm(`Clear override for "${pkg}" (${eco})? It will return to automatic policy.`)) return;
   }
 
-  const headers = {'Content-Type': 'application/json'};
-  if (authHeader) headers['Authorization'] = authHeader;
+  const headers = {...getAuthHeaders(), 'Content-Type': 'application/json'};
 
   const resp = await fetch('/api/packages/override', {
     method: 'POST',
     headers: headers,
     body: JSON.stringify({package: pkg, ecosystem: eco, action: action})
   });
-  if (resp.ok) refresh();
+  if (resp.ok) {
+    const data = await resp.json();
+    refresh();
+    // Offer to create MR for permanent policy change
+    if (action !== 'clear') {
+      promptCreateMR(pkg, eco, action, data.expires_in_hours);
+    }
+  }
   else if (resp.status === 401 || resp.status === 403) alert('Authentication required. Please login first.');
   else alert('Failed: ' + await resp.text());
+}
+
+async function promptCreateMR(pkg, eco, action, expiresHours) {
+  const resp = await fetch(`/api/rules/mr-url?ecosystem=${eco}&package=${encodeURIComponent(pkg)}&action=${action}&reason=Emergency override from dashboard`);
+  const data = await resp.json();
+
+  if (!data.edit_url) return;
+
+  const modal = document.createElement('div');
+  modal.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(10,14,20,0.9);z-index:10001;display:flex;align-items:center;justify-content:center;';
+  modal.innerHTML = `
+    <div style="background:#161b22;border:1px solid #30363d;border-radius:12px;padding:24px;width:500px;max-width:90vw">
+      <h3 style="color:#e6edf3;font-size:14px;margin-bottom:12px">⛏ Override Applied (expires in ${expiresHours}h)</h3>
+      <p style="color:#8b949e;font-size:12px;margin-bottom:16px">
+        To make this permanent, add it to <code>rules.yaml</code> via merge request:
+      </p>
+      <pre style="background:#0d1117;border:1px solid #30363d;border-radius:6px;padding:12px;font-size:11px;color:#79c0ff;overflow-x:auto;margin-bottom:16px">${data.snippet}</pre>
+      <p style="color:#484f58;font-size:11px;margin-bottom:16px">
+        Add under <code>overrides: ${data.section}:</code> in rules.yaml
+      </p>
+      <p id="mr-copy-confirm" style="color:#3fb950;font-size:11px;margin-bottom:12px;display:none">✓ Snippet copied to clipboard</p>
+      <div style="display:flex;gap:8px">
+        <a href="${data.edit_url}" target="_blank" onclick="navigator.clipboard.writeText(\`${data.snippet}\`);document.getElementById('mr-copy-confirm').style.display='block'" style="flex:1;text-align:center;padding:10px;background:#238636;border:none;border-radius:6px;color:#fff;font-size:12px;font-weight:600;text-decoration:none;cursor:pointer">Open Editor & Create MR</a>
+        <button onclick="this.parentElement.parentElement.parentElement.remove()" style="flex:1;padding:10px;background:#21262d;border:1px solid #30363d;border-radius:6px;color:#c9d1d9;font-size:12px;cursor:pointer">Skip (expires in ${expiresHours}h)</button>
+      </div>
+    </div>
+  `;
+  document.body.appendChild(modal);
 }
 
 function timeAgo(ts) {
@@ -979,7 +1364,7 @@ function timeAgo(ts) {
 }
 
 function getNexusUrl(pkg, ecosystem, version) {
-  const nexusBase = window.location.origin;
+  const nexusBase = window._nexusUrl || '';
   if (ecosystem === 'npm') {
     return `${nexusBase}/#browse/search/npm=${pkg}`;
   } else if (ecosystem === 'maven') {
@@ -999,7 +1384,7 @@ function getNexusUrl(pkg, ecosystem, version) {
 
 async function loadSettings() {
   try {
-    const headers = authHeader ? {'Authorization': authHeader} : {};
+    const headers = getAuthHeaders();
     const resp = await fetch('/api/settings', {headers});
     if (!resp.ok) return;
     const data = await resp.json();
@@ -1034,12 +1419,27 @@ async function loadSettings() {
       const auditData = await auditResp.json();
       const auditEl = document.getElementById('audit-log');
       if (auditData.log && auditData.log.length > 0) {
-        auditEl.innerHTML = auditData.log.map(e =>
-          `<div style="padding:4px 0;border-bottom:1px solid #1e2a3a">
-            <span style="color:#8b949e">${timeAgo(e.timestamp)}</span> —
-            <span style="color:#58a6ff">${e.user}</span> ${e.action === 'token_generated' ? 'generated new bypass token' : 'changed: ' + Object.entries(e.changes || {}).map(([k,v]) => '<code>' + k + '=' + v + '</code>').join(', ')}
-          </div>`
-        ).join('');
+        auditEl.innerHTML = auditData.log.map(e => {
+          let detail = '';
+          if (e.action === 'token_generated') {
+            detail = '🔑 Generated new bypass token';
+          } else if (e.action === 'settings_update') {
+            detail = '⚙️ Settings: ' + Object.entries(e.changes || {}).map(([k,v]) => '<code>' + k + ' → ' + v + '</code>').join(', ');
+          } else if (e.action && e.action.startsWith('override_')) {
+            const act = e.action.replace('override_', '');
+            const icon = act === 'deny' ? '⛔' : act === 'allow' ? '✓' : '↺';
+            detail = icon + ' Override <strong>' + act + '</strong>: ' + (e.ecosystem || '') + '/' + (e.package || '') + (e.expires_in_hours ? ' <span style="color:#484f58">(expires ' + e.expires_in_hours + 'h)</span>' : '');
+          } else if (e.action === 'clear_allowed_cache') {
+            detail = '🗑 Cleared ' + (e.cleared || 0) + ' allowed cache entries';
+          } else {
+            detail = e.action + (e.changes ? ': ' + JSON.stringify(e.changes) : '');
+          }
+          return `<div style="padding:6px 0;border-bottom:1px solid #1e2a3a">
+            <span style="color:#8b949e;font-size:10px">${timeAgo(e.timestamp)}</span>
+            <span style="color:#58a6ff;margin-left:6px">${e.user}</span>
+            <div style="margin-top:2px;color:#c5cdd8">${detail}</div>
+          </div>`;
+        }).join('');
       } else {
         auditEl.innerHTML = '<span style="color:#484f58">No changes recorded yet.</span>';
       }
@@ -1047,10 +1447,56 @@ async function loadSettings() {
   } catch(e) { console.error('Failed to load settings:', e); }
 }
 
+async function loadAdminConfig() {
+  try {
+    const resp = await fetch('/api/admin/config', {headers: getAuthHeaders()});
+    if (!resp.ok) return;
+    const data = await resp.json();
+
+    // Security section
+    const s = data.security;
+    document.getElementById('admin-ldap-uri').textContent = s.ldap_uri;
+    document.getElementById('admin-ldap-domain').textContent = s.ldap_domain;
+    document.getElementById('admin-ldap-admin-group').textContent = s.ldap_admin_group;
+    document.getElementById('admin-ldap-user-group').textContent = s.ldap_user_group;
+    document.getElementById('admin-ldap-base-dn').textContent = s.ldap_base_dn;
+    document.getElementById('admin-auth-enabled').textContent = s.auth_enabled ? 'Yes' : 'No';
+    document.getElementById('admin-session-ttl').textContent = s.session_ttl;
+    document.getElementById('admin-override-ttl').textContent = s.override_ttl;
+
+    // Integration section
+    const i = data.integration;
+    document.getElementById('admin-nexus-url').textContent = i.nexus_url;
+    document.getElementById('admin-nexus-user').textContent = i.nexus_user;
+    document.getElementById('admin-rules-repo').textContent = i.rules_repo;
+    document.getElementById('admin-redis-url').textContent = i.redis_url;
+
+    // Data sources section
+    const srcBody = document.getElementById('admin-sources-body');
+    const sources = await fetch('/api/sources').then(r => r.json());
+    const sourceStatus = {};
+    (sources.sources || []).forEach(s => { sourceStatus[s.name] = s; });
+
+    srcBody.innerHTML = data.data_sources.map(ds => {
+      const live = sourceStatus[ds.name];
+      const statusDot = live && live.last_pull ? '<span style="color:#3fb950">●</span> active' : '<span style="color:#484f58">●</span> idle';
+      const lastChecked = live && live.last_pull ? timeAgo(live.last_pull) : 'Never';
+      const authBadge = ds.auth === 'none (rate limited)' ? '<span style="color:#d29922">⚠ ' + ds.auth + '</span>' : '<span style="color:#3fb950">' + ds.auth + '</span>';
+      return `<tr>
+        <td><strong>${ds.name}</strong><br><span style="font-size:10px;color:#484f58">${ds.type}</span></td>
+        <td>${statusDot}</td>
+        <td>${ds.poll_interval}</td>
+        <td>${lastChecked}</td>
+        <td>${authBadge}</td>
+      </tr>`;
+    }).join('');
+  } catch(e) { console.error('Failed to load admin config:', e); }
+}
+
 async function generateToken() {
   if (!confirm('Generate a new bypass token? The old token will stop working immediately.')) return;
-  const headers = {'Content-Type': 'application/json'};
-  if (authHeader) headers['Authorization'] = authHeader;
+  const headers = {...getAuthHeaders(), 'Content-Type': 'application/json'};
+  
   const resp = await fetch('/api/token/generate', {method: 'POST', headers});
   if (resp.ok) {
     const data = await resp.json();
@@ -1072,8 +1518,8 @@ async function saveSettings() {
     cache_ttl_blocked: document.getElementById('set-cache-ttl-blocked').value,
   };
 
-  const headers = {'Content-Type': 'application/json'};
-  if (authHeader) headers['Authorization'] = authHeader;
+  const headers = {...getAuthHeaders(), 'Content-Type': 'application/json'};
+  
 
   const resp = await fetch('/api/settings', {method: 'POST', headers, body: JSON.stringify(payload)});
   const statusEl = document.getElementById('settings-status');
@@ -1091,6 +1537,8 @@ async function saveSettings() {
 
 checkAuth();
 refresh();
+// Fetch Nexus URL for package links
+fetch('/api/nexus-url').then(r => r.json()).then(d => { window._nexusUrl = d.url || ''; }).catch(() => {});
 setInterval(refresh, 5000);
 </script>
 </body>

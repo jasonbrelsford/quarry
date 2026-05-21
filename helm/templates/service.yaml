@@ -3,7 +3,7 @@ kind: Service
 metadata:
   name: {{ .Release.Name }}
   labels:
-    app: nexus-cooling-proxy
+    app: quarry
 spec:
   type: ClusterIP
   ports:
@@ -12,7 +12,7 @@ spec:
       protocol: TCP
       name: http
   selector:
-    app: nexus-cooling-proxy
+    app: quarry
 ---
 {{- if .Values.redis.enabled }}
 apiVersion: v1
@@ -20,7 +20,7 @@ kind: Service
 metadata:
   name: {{ .Release.Name }}-redis
   labels:
-    app: nexus-cooling-proxy-redis
+    app: quarry-redis
 spec:
   type: ClusterIP
   ports:
@@ -28,5 +28,5 @@ spec:
       targetPort: 6379
       protocol: TCP
   selector:
-    app: nexus-cooling-proxy-redis
+    app: quarry-redis
 {{- end }}

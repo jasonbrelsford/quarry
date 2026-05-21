@@ -44,6 +44,7 @@ services:
       NEXUS_PASSWORD: "${NEXUS_PASSWORD:-}"
       REDIS_URL: "${REDIS_URL:-redis://redis:6379}"
       GITHUB_WEBHOOK_SECRET: "${GITHUB_WEBHOOK_SECRET:-}"
+      GITHUB_TOKEN: "${GITHUB_TOKEN:-}"
       LOG_LEVEL: "DEBUG"
     depends_on:
       - redis
@@ -57,6 +58,8 @@ services:
     environment:
       REDIS_URL: "${REDIS_URL:-redis://redis:6379}"
       VALIDATOR_URL: "${VALIDATOR_URL:-http://validator:8080}"
+      QUARANTINE_URL: "${QUARANTINE_URL:-http://quarantine:8090}"
+      RULES_REPO_URL: "${RULES_REPO_URL:-}"
       LDAP_URI: "${LDAP_URI:-ldap://ldap.example.com:389}"
       LDAP_DOMAIN: "${LDAP_DOMAIN:-EXAMPLE}"
       LDAP_REQUIRED_GROUP: "${LDAP_REQUIRED_GROUP:-admins}"
