@@ -33,7 +33,7 @@ LDAP_BASE_DN = os.environ.get("LDAP_BASE_DN", "DC=example,DC=com")
 AUTH_ENABLED = os.environ.get("AUTH_ENABLED", "true").lower() == "true"
 VALIDATOR_URL = os.environ.get("VALIDATOR_URL", "http://validator:8080")
 QUARANTINE_URL = os.environ.get("QUARANTINE_URL", "http://quarantine:8090")
-RULES_REPO_URL = os.environ.get("RULES_REPO_URL", "")  # e.g. https://gitlab.com/bethematch/dcs/devops/automation/quarry
+RULES_REPO_URL = os.environ.get("RULES_REPO_URL", "")  # e.g. https://gitlab.com/myorg/quarry
 SESSION_TTL = int(os.environ.get("SESSION_TTL", "28800"))  # 8 hours in seconds
 
 app = FastAPI(title="Quarry Dashboard")
