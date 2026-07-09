@@ -3,6 +3,9 @@
 Reverse proxy that sits in front of Nexus and blocks packages published less than 7 days ago.
 Prevents supply chain attacks that exploit the window between package publication and malware detection.
 
+## Test Render Deployment - takes a minute to startup
+https://nexus-cooling-proxy.onrender.com
+
 ## Architecture
 
 ```
