@@ -394,7 +394,8 @@ async def validate(request: Request):
     ecosystem = parsed["ecosystem"]
     package = parsed["package"]
     version = parsed.get("version")
-    cache_key = f"cooling:{ecosystem}:{package}"
+    # Include version in cache key so metadata lookups don't mask versioned blocks
+    cache_key = f"cooling:{ecosystem}:{package}:{version or '_metadata'}"
 
     # Store version info for dashboard display
     if cache and version:
@@ -715,7 +716,7 @@ async def test_simulate(
         return {"decision": "allow", "reason": "Permanently allowed by rules.yaml", "uri": uri, "source": "rules_file"}
 
     # Check cache
-    cache_key = f"cooling:{ecosystem.value}:{package}"
+    cache_key = f"cooling:{ecosystem.value}:{package}:{version or '_metadata'}"
     if cache:
         cached = cache.get(cache_key)
         if cached:
